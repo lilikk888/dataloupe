@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.0
+
+PII / sensitive-information detection.
+
+**`dataloupe` now scans every column for patterns that should not be shared or
+loaded into a warehouse un-redacted:** email, phone number, ID card, bank card
+(verified with the Luhn checksum so a random 16-digit string is not flagged),
+IPv4 address, and URL. The scan runs on the raw cell strings of *every* column,
+not just text ones — a phone number stored as a bare 11-digit string lives in an
+`int` column and would slip past a text-only check otherwise.
+
+Precision matters for a feature like this, so a column only flags when **80%+ of
+its sampled cells match**, and the sample is capped at 200 values regardless of
+file size. A single stray email in a name column therefore stays quiet, while a
+column that *is* emails is caught. Two correctness traps were closed here:
+
+- An 18-digit ID card passes Luhn about 1 time in 10, so it was being double-flagged
+  as a bank card. The bank-card check now skips any cell that already matched the
+  ID-card pattern.
+- Raw samples were only being exposed on text columns, so int columns showed no
+  findings at all. The sample is now exported for every column kind.
+
+`examples/users.csv` demonstrates the feature.
+
 ## 1.2.0
 
 Two-file schema drift detection, plus input hardening.

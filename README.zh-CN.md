@@ -95,6 +95,9 @@ python dataloupe.py huge.csv --limit 100000
 # 直接生成建表语句
 python dataloupe.py data.csv --sql postgres
 
+# 顺手看看有没有敏感信息（邮箱 / 手机号 / 身份证号 / 银行卡号）
+python dataloupe.py users.csv
+
 # 对比两份导出，抓结构漂移（新列 / 删列 / 重命名 / 类型变了）
 python dataloupe.py last_week.csv today.csv --diff
 
@@ -267,6 +270,9 @@ python dataloupe.py last_week.csv today.csv --diff
 - **仅大小写不同的列名**（`id` 和 `ID`——SQL Server、Excel、多数 ORM 不区分大小写）
 - **CSV 注入**：以 `=` `+` `-` `@` 开头的值，在 Excel / WPS 里会被当公式执行
   （`=cmd|'/C calc'!A0` 是经典载荷），而纯数字 `-5` 不会误报
+- **敏感信息（PII）**：邮箱、手机号、身份证号、银行卡号（Luhn 校验）、IPv4、URL。
+  一列要 80% 以上样本都命中才报，避免个别脏值误报；银行卡号还会过 Luhn 校验，
+  身份证号不会顺带被误认成银行卡
 
 **列类型**
 `int` · `float` · `bool` · `date` · `text` · `empty`，用 95% 容忍度推断，
@@ -391,12 +397,12 @@ for row in rows:              # 一次只持有一行
 python -m unittest discover -s tests -v
 ```
 
-146 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
+152 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
 流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、退出码与 CI 门禁、质量检测、数据清洗、
 xlsx 解析、HTML 转义、CLI 退出码、两文件 schema 漂移对比（增删列、疑似重命名、类型污染、质量退化）。
 
 ```
-Ran 146 tests in 7.94s
+Ran 152 tests in 9.6s
 
 OK
 ```

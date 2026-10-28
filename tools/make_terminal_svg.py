@@ -122,7 +122,7 @@ def escape(ch: str) -> str:
 
 def main():
     dl.USE_COLOR = True
-    profile = dl.analyse(ROOT / "examples" / "messy.csv")
+    profile = dl.analyse(ROOT / "examples" / "users.csv")
     text = dl.render_terminal(profile, show_preview=False)
     svg = build_svg(parse_ansi(text))
     OUT.write_text(svg, encoding="utf-8")

@@ -277,6 +277,10 @@ near-perfectly correlated columns are grouped with a union-find before reporting
 - **CSV injection**: cells starting with `=` `+` `-` `@`, which Excel and WPS
   execute as formulas (`=cmd|'/C calc'!A0` is the classic payload). Plain
   numbers like `-5` are not flagged
+- **Sensitive information (PII)**: email, phone, ID card, bank card (Luhn
+  checked), IPv4, URL. A column only flags when 80%+ of its sample matches, so a
+  stray value does not cause a false alarm; ID-card numbers are not also misread
+  as bank cards
 
 **Column types**
 `int` · `float` · `bool` · `date` · `text` · `empty`, inferred with a 95%
@@ -411,13 +415,13 @@ Three things make it fast:
 python -m unittest discover -s tests -v
 ```
 
-146 tests covering encoding detection, delimiter sniffing, type inference,
+152 tests covering encoding detection, delimiter sniffing, type inference,
 statistics correctness, correlation, streaming-vs-one-shot equivalence,
 reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, exit codes, quality checks, cleaning, xlsx parsing, HTML escaping, and
 two-file schema drift (added/removed columns, likely renames, type pollution, quality regression).
 
 ```
-Ran 146 tests in 7.94s
+Ran 152 tests in 9.6s
 
 OK
 ```

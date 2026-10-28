@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Iterator
 from xml.etree import ElementTree as ET
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -83,6 +83,11 @@ DISTINCT_CAP = 100_000
 
 #: Upper bound on rows remembered when hunting for duplicate rows.
 DEDUP_CAP = 200_000
+
+#: Raw text values kept per column to hunt for sensitive patterns (emails,
+#: phone numbers, ID cards...). Bounded, so it costs the same on a 10-row file
+#: as on a 10-million-row one.
+PII_SAMPLE_CAP = 200
 
 #: Column samples are drawn with a fixed seed so two runs on the same file
 #: always print the same numbers.
@@ -255,6 +260,65 @@ def looks_like_formula(text: str) -> bool:
     if head in ("+", "-"):
         return _to_number(text) is None
     return False
+
+
+#: Sensitive-pattern checks. Each entry is (label, matcher); a matcher takes a
+#: single stripped cell and returns True when the value looks like that kind of
+#: secret. The label is what gets reported to the user.
+PII_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("邮箱", re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")),
+    ("身份证号", re.compile(r"^\d{17}[\dXx]$|^\d{15}$")),
+    ("银行卡号", re.compile(r"^(?:\d[ -]?){13,19}$")),
+    ("IPv4 地址", re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")),
+    ("手机号", re.compile(r"^1[3-9]\d{9}$")),
+    ("URL", re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)),
+]
+
+
+def _luhn_ok(digits: str) -> bool:
+    """Luhn checksum — the one real test that separates a card number from a
+    random 16-digit string, so it keeps false positives down."""
+    total = 0
+    parity = len(digits) % 2
+    for i, ch in enumerate(digits):
+        d = ord(ch) - 48
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def detect_pii(sample: list[str]) -> dict[str, float]:
+    """Return PII labels mapped to the share of sampled cells that match.
+
+    Only ``sample`` (at most PII_SAMPLE_CAP raw values) is tested, so the cost
+    is flat regardless of file size. A label is reported only when it clears
+    a high bar (80% of the sample), because a stray email in a name column is
+    not the same as a column that *is* email addresses.
+    """
+    if not sample:
+        return {}
+    counts: dict[str, int] = {}
+    for cell in sample:
+        compact = re.sub(r"[ -]", "", cell) if any(c in cell for c in " -") else cell
+        matched_id = False
+        for label, pattern in PII_PATTERNS:
+            if label == "银行卡号":
+                # Already proven to be an ID card (or similar 18-digit string):
+                # a 1-in-10 coincidence passes Luhn, so don't double-flag it.
+                if matched_id or not compact.isdigit() or not (13 <= len(compact) <= 19):
+                    continue
+                if _luhn_ok(compact):
+                    counts[label] = counts.get(label, 0) + 1
+            elif pattern.match(cell):
+                if label == "身份证号":
+                    matched_id = True
+                counts[label] = counts.get(label, 0) + 1
+    n = len(sample)
+    scored = {label: count / n for label, count in counts.items()}
+    return {label: share for label, share in scored.items() if share >= 0.8}
 
 
 def has_fullwidth_ascii(text: str) -> bool:
@@ -953,6 +1017,10 @@ class ColumnProfile:
     fullwidth: int = 0
     control_chars: int = 0
     formula_cells: int = 0
+    # raw values kept for sensitive-pattern detection (flat, capped)
+    value_sample_raw: list[str] = field(default_factory=list)
+    # PII labels -> share of sampled cells that match (set by find_issues)
+    pii: dict[str, float] = field(default_factory=dict)
     empty_name: bool = False
     duplicate_name: bool = False
     raw_name: str = ""
@@ -1075,6 +1143,7 @@ class ColumnAccumulator:
         "_date_min", "_date_max", "_formats", "_ambiguous", "_dated",
         "_hygiene_seen", "_leading", "_trailing", "_fullwidth", "_control",
         "_formula",
+        "_pii_sample", "_pii_seen", "_pii_rng", "_pii_w", "_pii_next",
     )
 
     def __init__(self, name: str, index: int) -> None:
@@ -1121,6 +1190,13 @@ class ColumnAccumulator:
         self._control = 0
         self._formula = 0
 
+        # Bounded reservoir of raw text, purely for sensitive-pattern scans.
+        self._pii_sample: list[str] = []
+        self._pii_seen = 0
+        self._pii_rng = random.Random(RESERVOIR_SEED + 2_000_000 + index)
+        self._pii_w = 1.0
+        self._pii_next = 1
+
     # -- ingest ------------------------------------------------------------
 
     def add(self, value: str) -> None:
@@ -1159,6 +1235,11 @@ class ColumnAccumulator:
         first = text[0]
         if first in "=@+-" and looks_like_formula(text):
             self._formula += 1
+
+        # Sensitive-pattern scans need to see real cell strings, so keep a small
+        # uniform sample of them. Cheap and flat: at most PII_SAMPLE_CAP values
+        # live here no matter how many rows flow through.
+        self._reservoir_pii(text)
 
         if self._hygiene_seen < HYGIENE_SAMPLE:
             self._hygiene_seen += 1
@@ -1274,6 +1355,23 @@ class ColumnAccumulator:
     def _skip(self) -> int:
         return _skip_ahead(self._rng, self._w)
 
+    def _reservoir_pii(self, text: str) -> None:
+        """Algorithm-L reservoir of raw text, capped at PII_SAMPLE_CAP."""
+        seen = self._pii_seen + 1
+        self._pii_seen = seen
+        sample = self._pii_sample
+        cap = PII_SAMPLE_CAP
+        if seen <= cap:
+            sample.append(text)
+            if seen == cap:
+                self._pii_w = max(math.exp(math.log(self._pii_rng.random() or 1e-12) / cap), 1e-12)
+                self._pii_next = seen + _skip_ahead(self._pii_rng, self._pii_w)
+            return
+        if seen >= self._pii_next:
+            sample[self._pii_rng.randrange(cap)] = text
+            self._pii_w = max(self._pii_w * math.exp(math.log(self._pii_rng.random() or 1e-12) / cap), 1e-12)
+            self._pii_next = seen + _skip_ahead(self._pii_rng, self._pii_w)
+
     # -- output ------------------------------------------------------------
 
     def finish(self) -> ColumnProfile:
@@ -1287,6 +1385,9 @@ class ColumnAccumulator:
         col.mismatch = self.mismatch
         col.distinct = self._distinct_count
         col.distinct_capped = self._distinct_capped
+        # Raw strings are kept for every column, so a phone number stored as a
+        # bare 11-digit string (in an int column) still gets scanned.
+        col.value_sample_raw = list(self._pii_sample)
         col.leading_space = self._leading
         col.trailing_space = self._trailing
         col.fullwidth = self._fullwidth
@@ -1477,6 +1578,21 @@ def find_issues(profile: Profile) -> list[Issue]:
 
     for col in profile.columns:
         label = col.name or f"第{col.index + 1}列"
+
+        # Sensitive-pattern scan. Runs on every column (not just text ones): a
+        # phone number stored as a bare 11-digit string lands in an int column
+        # and would otherwise slip past a text-only check. The sample is capped,
+        # so cost is flat; a column only flags when 80%+ of its sample matches,
+        # so a lone email in a name field does not.
+        col.pii = detect_pii(col.value_sample_raw)
+        if col.pii:
+            findings = "、".join(f"{name} {share:.0%}" for name, share in col.pii.items())
+            issues.append(Issue(
+                "high", "疑似包含敏感信息",
+                f"「{label}」样本中有 {findings} 命中",
+                column=col.name,
+                suggestion="确认该列是否含有 PII/密钥；在分享或入库前先做脱敏",
+            ))
 
         if col.kind == "empty" and col.total:
             issues.append(Issue("high", "整列为空", f"「{label}」没有任何数据", column=col.name,
@@ -1939,6 +2055,14 @@ def render_terminal(profile: Profile, show_preview: bool = False) -> str:
             ["列 A", "列 B", "相关系数"], corr_rows, ["left", "left", "right"]))
         lines.append("")
 
+    pii_cols = [(col.name, col.pii) for col in profile.columns if col.pii]
+    if pii_cols:
+        lines.append("  " + bold("⚠ 疑似敏感信息") + dim("  分享或入库前请先脱敏"))
+        for name, pii in pii_cols:
+            findings = "、".join(f"{label} {share:.0%}" for label, share in pii.items())
+            lines.append(f"  {tint('●', '31')} {name}: {findings}")
+        lines.append("")
+
     if profile.issues:
         lines.append("  " + bold("发现的问题"))
         for issue in profile.issues:
@@ -2038,6 +2162,9 @@ td.num{text-align:right}
 footer{margin-top:48px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);
   font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 .empty-note{color:var(--muted);font-size:13.5px}
+.pii{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px}
+.pii-tag{background:#fde2e1;color:#b42318;border:1px solid #f6b8b3;border-radius:6px;
+  padding:2px 8px;font-size:11.5px;font-weight:600}
 .note{color:var(--muted);font-size:12.5px;line-height:1.6;margin:14px 0 0}
 .corr-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
 .corr{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;
@@ -2129,11 +2256,18 @@ def _column_card(col: ColumnProfile) -> str:
         for value, count in col.top_values[:3]:
             items.append(f"<dt>{_esc(truncate(value, 16))}</dt><dd>{count:,}</dd>")
 
+    pii_badge = ""
+    if col.pii:
+        tags = " ".join(
+            f'<span class="pii-tag">{_esc(name)}</span>' for name in col.pii
+        )
+        pii_badge = f'<div class="pii">{tags}</div>'
+
     return (
         f'<div class="col"><div class="col-head">'
         f'<span class="col-name" title="{_esc(col.name)}">{_esc(col.name)}</span>'
         f'<span class="kind {_esc(col.kind)}">{_esc(col.kind)}</span></div>'
-        f'<dl class="kv">{"".join(items)}</dl>{_sparkline(col)}</div>'
+        f'<dl class="kv">{"".join(items)}</dl>{_sparkline(col)}{pii_badge}</div>'
     )
 
 
@@ -2300,6 +2434,8 @@ def render_json(profile: Profile) -> str:
                 "median": c.num_median, "std": c.num_std, "outliers": c.num_outliers,
                 "date_min": c.date_min, "date_max": c.date_max,
                 "top_values": c.top_values,
+                "formula_cells": c.formula_cells,
+                "pii": c.pii,
             }
             for c in profile.columns
         ],

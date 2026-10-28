@@ -884,6 +884,68 @@ class TestFormulaInjection(unittest.TestCase):
         self.assertEqual(profile.columns[1].formula_cells, 1)
 
 
+class TestPii(unittest.TestCase):
+    """Sensitive-pattern detection has to be precise: a stray email in a name
+    column must not fire, but a column that *is* emails must."""
+
+    def test_each_pattern_matches_its_own_kind(self):
+        cases = {
+            "邮箱": "user.name+tag@example.co.uk",
+            "身份证号": "110101199003071234",
+            "手机号": "13800138000",
+            "IPv4 地址": "192.168.1.1",
+            "URL": "https://example.com/path",
+        }
+        for label, value in cases.items():
+            scored = dl.detect_pii([value] * 10)
+            self.assertIn(label, scored, value)
+            self.assertEqual(scored[label], 1.0)
+
+    def test_id_card_is_not_double_flagged_as_bank_card(self):
+        scored = dl.detect_pii(["110101199003071234"] * 10)
+        self.assertIn("身份证号", scored)
+        self.assertNotIn("银行卡号", scored)
+
+    def test_bank_card_passes_luhn_only(self):
+        # A real Luhn-valid 16-digit card number.
+        self.assertIn("银行卡号", dl.detect_pii(["4111 1111 1111 1111"] * 10))
+        # A random 16-digit string that fails Luhn is not a card.
+        self.assertNotIn("银行卡号", dl.detect_pii(["1234 5678 9012 3456"] * 10))
+
+    def test_a_single_stray_email_does_not_flag_the_column(self):
+        # 9 names, 1 email: the email share is 10%, under the 80% bar.
+        scored = dl.detect_pii(["张三", "李四", "王五", "赵六", "钱七",
+                                "孙八", "周九", "吴十", "郑一", "a@b.com"])
+        self.assertNotIn("邮箱", scored)
+
+    def test_reported_as_a_high_severity_issue(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "pii.csv"
+        path.write_text(
+            "id,email\n" + "".join(f"{i},user{i}@example.com\n" for i in range(12)),
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        email = profile.columns[1]
+        self.assertIn("邮箱", email.pii)
+        titles = [issue.title for issue in profile.issues if issue.column == "email"]
+        self.assertIn("疑似包含敏感信息", titles)
+
+    def test_phone_in_an_int_column_is_still_found(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        # No header/quote tricks: bare 11-digit numbers land in an int column.
+        path = directory / "phones.csv"
+        path.write_text(
+            "phone\n" + "".join(f"138{i:08d}\n" for i in range(12)),
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        phone = profile.columns[0]
+        self.assertIn("手机号", phone.pii)
+
+
 class TestHeaderCollisions(unittest.TestCase):
     def test_case_only_collision_is_reported(self):
         directory = Path(tempfile.mkdtemp())
