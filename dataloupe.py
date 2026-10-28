@@ -26,6 +26,7 @@ import sys
 import time
 import unicodedata
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -600,6 +601,66 @@ def parse_date(value: str) -> datetime | None:
     return None
 
 
+DATE_FORMAT_LABELS = {
+    "%Y-%m-%d": "YYYY-MM-DD",
+    "%Y/%m/%d": "YYYY/MM/DD",
+    "%Y.%m.%d": "YYYY.MM.DD",
+    "%d/%m/%Y": "DD/MM/YYYY",
+    "%m/%d/%Y": "MM/DD/YYYY",
+    "%d-%m-%Y": "DD-MM-YYYY",
+    "%Y-%m-%d %H:%M:%S": "YYYY-MM-DD HH:MM:SS",
+    "%Y/%m/%d %H:%M:%S": "YYYY/MM/DD HH:MM:SS",
+    "%Y-%m-%d %H:%M": "YYYY-MM-DD HH:MM",
+    "%Y-%m-%dT%H:%M:%S": "ISO 8601",
+    "%Y-%m-%dT%H:%M:%SZ": "ISO 8601 UTC",
+    "%Y-%m-%dT%H:%M:%S.%fZ": "ISO 8601 ms",
+    "%Y-%m-%dT%H:%M:%S%z": "ISO 8601 +TZ",
+    "%Y年%m月%d日": "YYYY年MM月DD日",
+    "%Y-%m": "YYYY-MM",
+}
+
+
+def detect_date_format(value: str) -> str | None:
+    """Name the shape a date string uses, or None if it is not a date.
+
+    Only used for reporting. A column mixing ``2024-01-05`` with ``05/01/2024``
+    is a genuine hazard: both parse, and they disagree about which number is
+    the month.
+    """
+    text = value.strip()
+    if ISO_LIKE_RE.match(text):
+        base = {"-": "YYYY-MM-DD", "/": "YYYY/MM/DD", ".": "YYYY.MM.DD"}.get(text[4], "YYYY-MM-DD")
+        if ":" in text:
+            base += " HH:MM:SS"
+            if "Z" in text:
+                base += " UTC"
+        return base
+    for fmt in DATE_FORMATS:
+        try:
+            datetime.strptime(text, fmt)
+            return DATE_FORMAT_LABELS.get(fmt, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+AMBIGUOUS_DATE_RE = re.compile(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$")
+
+
+def is_ambiguous_date(value: str) -> bool:
+    """True when a slash/dash date cannot be resolved without knowing the locale.
+
+    ``03/05/2024`` is 3 May in Europe and 5 March in the US. Both numbers are
+    below 13, so the shape alone does not decide it. ``25/03/2024`` is
+    unambiguous — 25 cannot be a month.
+    """
+    match = AMBIGUOUS_DATE_RE.match(value.strip())
+    if not match:
+        return False
+    first, second = int(match.group(1)), int(match.group(2))
+    return first <= 12 and second <= 12
+
+
 def classify_value(value: str) -> str:
     """Classify one raw cell as bool / int / float / date / text."""
     text = value.strip()
@@ -689,6 +750,8 @@ class ColumnProfile:
     # dates
     date_min: str | None = None
     date_max: str | None = None
+    date_formats: list[str] = field(default_factory=list)
+    ambiguous_dates: int = 0
     # hygiene counters
     leading_space: int = 0
     trailing_space: int = 0
@@ -832,6 +895,10 @@ def profile_column(name: str, index: int, values: list[str]) -> ColumnProfile:
         if stamps:
             col.date_min = min(stamps).strftime("%Y-%m-%d")
             col.date_max = max(stamps).strftime("%Y-%m-%d")
+        shapes = Counter(detect_date_format(v) for v in non_empty[:TYPE_SAMPLE])
+        shapes.pop(None, None)
+        col.date_formats = [name for name, _ in shapes.most_common()]
+        col.ambiguous_dates = sum(1 for v in non_empty[:TYPE_SAMPLE] if is_ambiguous_date(v))
 
     else:
         lengths = [len(v.strip()) for v in non_empty]
@@ -975,6 +1042,25 @@ def find_issues(profile: Profile) -> list[Issue]:
             issues.append(Issue("medium", "含不可见字符",
                                 f"「{label}」有 {col.control_chars} 个值含制表符/控制字符",
                                 column=col.name, suggestion="这些字符肉眼看不见，但会让字符串比较失败"))
+
+        if col.kind == "date" and len(col.date_formats) > 1:
+            issues.append(Issue(
+                "high", "日期格式混用",
+                f"「{label}」同时存在 {len(col.date_formats)} 种格式："
+                f"{'、'.join(col.date_formats[:4])}",
+                column=col.name,
+                suggestion="DD/MM/YYYY 和 MM/DD/YYYY 只差顺序，程序无法自动判断，"
+                           "必须先人工统一，否则整列日期会错位",
+            ))
+
+        if col.ambiguous_dates:
+            issues.append(Issue(
+                "medium", "日期存在歧义",
+                f"「{label}」有 {col.ambiguous_dates} 个日期无法确定日月顺序（如 03/05/2024）",
+                column=col.name,
+                suggestion="欧美习惯相反，本工具按 日/月 解析；如果数据来自美国，"
+                           "整列日期会错位，建议统一改成 YYYY-MM-DD",
+            ))
 
         if col.distinct == 1 and col.total > 1:
             issues.append(Issue("low", "常量列", f"「{label}」所有值都一样", column=col.name,

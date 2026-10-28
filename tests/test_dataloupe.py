@@ -384,6 +384,60 @@ class TestOutputEncoding(unittest.TestCase):
         self.assertTrue(text.encode("utf-8"))
 
 
+class TestDateFormatDetection(unittest.TestCase):
+    def test_iso(self):
+        self.assertEqual(dl.detect_date_format("2024-01-05"), "YYYY-MM-DD")
+
+    def test_iso_with_time(self):
+        self.assertIn("HH:MM:SS", dl.detect_date_format("2024-01-05 10:30:00"))
+
+    def test_slash_year_first(self):
+        self.assertEqual(dl.detect_date_format("2024/01/05"), "YYYY/MM/DD")
+
+    def test_day_first(self):
+        self.assertEqual(dl.detect_date_format("05/03/2024"), "DD/MM/YYYY")
+
+    def test_ambiguous_slashed_date_prefers_day_first(self):
+        # 03/05/2024 could be either 3 May or 5 March. We resolve it as DD/MM
+        # (European) and report the ambiguity separately rather than guessing.
+        self.assertEqual(dl.detect_date_format("03/05/2024"), "DD/MM/YYYY")
+
+    def test_unambiguous_day_first(self):
+        self.assertEqual(dl.detect_date_format("25/03/2024"), "DD/MM/YYYY")
+
+    def test_ambiguous_detection(self):
+        self.assertTrue(dl.is_ambiguous_date("03/05/2024"))
+        self.assertTrue(dl.is_ambiguous_date("11-12-2024"))
+        self.assertFalse(dl.is_ambiguous_date("25/03/2024"))
+        self.assertFalse(dl.is_ambiguous_date("2024-01-05"))
+
+    def test_chinese_date(self):
+        self.assertEqual(dl.detect_date_format("2024年1月5日"), "YYYY年MM月DD日")
+
+    def test_not_a_date(self):
+        self.assertIsNone(dl.detect_date_format("hello"))
+
+    def test_mixed_formats_flagged_as_high(self):
+        path = Path(tempfile.mktemp(suffix=".csv"))
+        self.addCleanup(path.unlink, missing_ok=True)
+        path.write_text(
+            "id,when\n1,2024-01-05\n2,2024-02-11\n3,05/03/2024\n4,2024-04-20\n",
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        mixed = [i for i in profile.issues if i.title == "日期格式混用"]
+        self.assertEqual(len(mixed), 1)
+        self.assertEqual(mixed[0].severity, "high")
+
+    def test_single_format_not_flagged(self):
+        path = Path(tempfile.mktemp(suffix=".csv"))
+        self.addCleanup(path.unlink, missing_ok=True)
+        path.write_text("id,when\n1,2024-01-05\n2,2024-02-11\n3,2024-03-20\n",
+                        encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual([i for i in profile.issues if i.title == "日期格式混用"], [])
+
+
 class TestCorrelation(unittest.TestCase):
     def test_perfect_positive(self):
         r = dl.pearson([1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0])

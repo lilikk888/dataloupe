@@ -188,6 +188,9 @@ tolerance so a handful of dirty cells do not flip a numeric column to text.
 - Invisible control characters
 - Constant columns, near-unique ID columns, auto-increment sequences
 - Outliers by the 1.5 × IQR rule
+- **Date formats mixed inside one column** (`2024-01-05` next to `05/01/2024`)
+- **Ambiguous dates** where day and month are both ≤ 12, so no tool can tell
+  which is which
 - Numeric distribution, mean/median/std, histograms
 
 Every finding comes with a **suggested fix**, because "column X has 43% nulls"
@@ -271,12 +274,12 @@ Statistics themselves are always computed over the full column.
 python -m unittest discover -s tests -v
 ```
 
-86 tests covering encoding detection, delimiter sniffing, type inference,
+97 tests covering encoding detection, delimiter sniffing, type inference,
 statistics correctness, correlation, quality checks, cleaning, xlsx parsing,
 HTML escaping, and CLI exit codes.
 
 ```
-Ran 86 tests in 0.40s
+Ran 97 tests in 0.37s
 
 OK
 ```
