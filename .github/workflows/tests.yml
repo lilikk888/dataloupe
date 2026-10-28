@@ -77,7 +77,9 @@ jobs:
       - name: Drift detection runs on a two-file example
         shell: bash
         run: |
+          set +e
           python dataloupe.py examples/customers_old.csv examples/customers_new.csv --diff --no-color
+          python dataloupe.py examples/customers_old.csv examples/customers_new.csv --diff --json | grep -q '"drift": true'
           echo "OK: diff path exercised"
 
       - name: Survives a legacy Windows code page
