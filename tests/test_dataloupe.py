@@ -858,5 +858,110 @@ class TestMemoryCeiling(unittest.TestCase):
             self.assertLessEqual(col.distinct, dl.DISTINCT_CAP)
 
 
+class TestFormulaInjection(unittest.TestCase):
+    def test_flags_the_known_payloads(self):
+        for payload in ("=cmd|'/C calc'!A0", "@SUM(A1:A9)", '=HYPERLINK("http://x")',
+                        "+cmd|'/C calc'!A0", "-2+3+cmd|'/C calc'!A0"):
+            self.assertTrue(dl.looks_like_formula(payload), payload)
+
+    def test_leaves_plain_numbers_alone(self):
+        for value in ("-5", "+3", "-1.5e3", ".5", "2024-01-01", "abc"):
+            self.assertFalse(dl.looks_like_formula(value), value)
+
+    def test_reported_as_a_medium_issue(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "inject.csv"
+        path.write_text(
+            "name,note\n"
+            "a,=cmd|'/C calc'!A0\n"
+            "b,hello\n",
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        titles = [issue.title for issue in profile.issues if issue.column == "note"]
+        self.assertIn("存在可被 Excel 执行的单元格", titles)
+        self.assertEqual(profile.columns[1].formula_cells, 1)
+
+
+class TestHeaderCollisions(unittest.TestCase):
+    def test_case_only_collision_is_reported(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "case.csv"
+        path.write_text("id,ID,name\n1,2,x\n", encoding="utf-8")
+
+        profile = dl.analyse(path)
+        titles = [issue.title for issue in profile.issues]
+        self.assertIn("列名仅大小写不同", titles)
+        # They are distinct names, so the exact-duplicate check must not fire.
+        self.assertNotIn("列名重复", titles)
+
+    def test_identical_names_still_use_the_high_severity_path(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "dup.csv"
+        path.write_text("a,a\n1,2\n", encoding="utf-8")
+
+        profile = dl.analyse(path)
+        titles = [issue.title for issue in profile.issues]
+        self.assertIn("列名重复", titles)
+        self.assertNotIn("列名仅大小写不同", titles)
+
+
+class TestSqlOutput(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def _profile(self, text: str, name: str = "t.csv"):
+        path = self.directory / name
+        path.write_text(text, encoding="utf-8")
+        return dl.analyse(path)
+
+    def test_maps_types_for_postgres(self):
+        profile = self._profile("a,b,c,d\n1,1.5,true,2024-01-01\n2,2.5,false,2024-02-01\n")
+        sql = dl.render_sql(profile, "postgres")
+        self.assertIn("CREATE TABLE t (", sql)
+        self.assertIn("a  BIGINT", sql)
+        self.assertIn("b  DOUBLE PRECISION", sql)
+        self.assertIn("c  BOOLEAN", sql)
+        self.assertIn("d  DATE", sql)
+
+    def test_sqlite_has_no_date_or_boolean_types(self):
+        profile = self._profile("a,b\n1,2024-01-01\n2,2024-02-01\n")
+        sql = dl.render_sql(profile, "sqlite")
+        self.assertIn("a  INTEGER", sql)
+        self.assertIn("b  TEXT", sql)
+
+    def test_time_component_promotes_date_to_timestamp(self):
+        profile = self._profile("t\n2024-01-01 09:30:00\n2024-01-02 10:00:00\n")
+        self.assertIn("TIMESTAMP", dl.render_sql(profile, "postgres"))
+
+    def test_awkward_names_are_quoted(self):
+        profile = self._profile("Order,我的列\n1,2\n")
+        sql = dl.render_sql(profile, "postgres")
+        self.assertIn('"Order"', sql)
+        self.assertIn('"我的列"', sql)
+
+    def test_mysql_quotes_with_backticks(self):
+        profile = self._profile("Order\n1\n")
+        self.assertIn("`Order`", dl.render_sql(profile, "mysql"))
+
+    def test_table_name_can_be_overridden(self):
+        profile = self._profile("a\n1\n")
+        self.assertIn("CREATE TABLE events (", dl.render_sql(profile, "postgres", "events"))
+
+    def test_unknown_dialect_is_rejected(self):
+        profile = self._profile("a\n1\n")
+        with self.assertRaises(ValueError):
+            dl.render_sql(profile, "oracle")
+
+    def test_cli_prints_sql_and_exits_zero(self):
+        path = self.directory / "ok.csv"
+        path.write_text("a,a\n1,2\n", encoding="utf-8")
+        self.assertEqual(dl.main([str(path), "--no-color", "--sql", "postgres"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

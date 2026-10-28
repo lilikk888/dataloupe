@@ -87,6 +87,9 @@ python dataloupe.py data.csv --preview
 # 超大文件只抽样
 python dataloupe.py huge.csv --limit 100000
 
+# 直接生成建表语句
+python dataloupe.py data.csv --sql postgres
+
 # 修好数据另存一份（原文件不动）
 python dataloupe.py data.csv --fix
 ```
@@ -146,6 +149,43 @@ python dataloupe.py dirty.csv --fix -o clean.csv --dedupe --drop-empty-cols
 
 ---
 
+## 建表语句
+
+推断出来的类型可以直接变成 DDL，省掉「先看数据、再手写 CREATE TABLE」那一步。
+
+```bash
+python dataloupe.py sales.csv --sql postgres
+```
+
+```sql
+-- dataloupe 1.1.0 · sales.csv · 240 rows × 8 columns
+CREATE TABLE sales (
+    order_id    BIGINT,
+    order_date  DATE,
+    product     TEXT,
+    category    TEXT,
+    quantity    BIGINT,
+    unit_price  DOUBLE PRECISION,
+    customer    TEXT,
+    region      TEXT
+);
+```
+
+支持 `postgres` / `mysql` / `sqlite`。方言差异按各家的规矩处理：
+
+| | postgres | mysql | sqlite |
+|---|---|---|---|
+| 整数 | `BIGINT` | `BIGINT` | `INTEGER` |
+| 小数 | `DOUBLE PRECISION` | `DOUBLE` | `REAL` |
+| 布尔 | `BOOLEAN` | `TINYINT(1)` | `INTEGER` |
+| 日期 | `DATE` / `TIMESTAMP` | `DATE` / `DATETIME` | `TEXT` |
+
+带时间的日期会自动升成 `TIMESTAMP`。列名不是纯小写标识符（`Order`、`客户名称`、
+`user` 这种关键字）会自动加引号，MySQL 用反引号。表名默认取文件名，
+`--table events` 可以改。
+
+---
+
 ## 相关性
 
 每两个数值列之间都会算 Pearson 相关系数。|r| ≥ 0.5 的列出来；|r| ≥ 0.98 的
@@ -170,6 +210,9 @@ python dataloupe.py dirty.csv --fix -o clean.csv --dedupe --drop-empty-cols
 - 分隔符：逗号、制表符、分号、竖线——按「每行切出来的列数是否一致」判断
 - 行列数不一致的行（字段数与表头不符）
 - 重复列名、空列名
+- **仅大小写不同的列名**（`id` 和 `ID`——SQL Server、Excel、多数 ORM 不区分大小写）
+- **CSV 注入**：以 `=` `+` `-` `@` 开头的值，在 Excel / WPS 里会被当公式执行
+  （`=cmd|'/C calc'!A0` 是经典载荷），而纯数字 `-5` 不会误报
 
 **列类型**
 `int` · `float` · `bool` · `date` · `text` · `empty`，用 95% 容忍度推断，
@@ -294,12 +337,12 @@ for row in rows:              # 一次只持有一行
 python -m unittest discover -s tests -v
 ```
 
-116 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
-流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、质量检测、数据清洗、
+129 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
+流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、质量检测、数据清洗、
 xlsx 解析、HTML 转义、CLI 退出码。
 
 ```
-Ran 116 tests in 7.26s
+Ran 129 tests in 7.68s
 
 OK
 ```

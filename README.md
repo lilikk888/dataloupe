@@ -89,6 +89,9 @@ python dataloupe.py data.csv --preview
 # Sample a huge file instead of reading all of it
 python dataloupe.py huge.csv --limit 100000
 
+# Emit a CREATE TABLE statement from the inferred types
+python dataloupe.py data.csv --sql postgres
+
 # Repair the data into a new file (the original is untouched)
 python dataloupe.py data.csv --fix
 ```
@@ -151,6 +154,45 @@ looks numeric is left alone.
 
 ---
 
+## CREATE TABLE, inferred
+
+The inferred types turn straight into DDL, which skips the "read the data, then
+hand-write the schema" step.
+
+```bash
+python dataloupe.py sales.csv --sql postgres
+```
+
+```sql
+-- dataloupe 1.1.0 · sales.csv · 240 rows × 8 columns
+CREATE TABLE sales (
+    order_id    BIGINT,
+    order_date  DATE,
+    product     TEXT,
+    category    TEXT,
+    quantity    BIGINT,
+    unit_price  DOUBLE PRECISION,
+    customer    TEXT,
+    region      TEXT
+);
+```
+
+`postgres`, `mysql` and `sqlite` are supported, each with its own type names:
+
+| | postgres | mysql | sqlite |
+|---|---|---|---|
+| integer | `BIGINT` | `BIGINT` | `INTEGER` |
+| decimal | `DOUBLE PRECISION` | `DOUBLE` | `REAL` |
+| boolean | `BOOLEAN` | `TINYINT(1)` | `INTEGER` |
+| date | `DATE` / `TIMESTAMP` | `DATE` / `DATETIME` | `TEXT` |
+
+A date column that also carries times is promoted to `TIMESTAMP`. Column names
+that are not plain lowercase identifiers — `Order`, `客户名称`, the keyword
+`user` — are quoted automatically, with backticks on MySQL. The table name
+defaults to the file name; `--table events` overrides it.
+
+---
+
 ## Correlations
 
 Every pair of numeric columns gets a Pearson correlation. Pairs above |r| ≥ 0.5
@@ -177,6 +219,11 @@ near-perfectly correlated columns are grouped with a union-find before reporting
 - Delimiter: comma, tab, semicolon, pipe — chosen by per-line consistency
 - Ragged rows (field count ≠ header)
 - Duplicate and empty column names
+- **Names that differ only by case** (`id` and `ID` collide in SQL Server,
+  Excel, and most ORMs)
+- **CSV injection**: cells starting with `=` `+` `-` `@`, which Excel and WPS
+  execute as formulas (`=cmd|'/C calc'!A0` is the classic payload). Plain
+  numbers like `-5` are not flagged
 
 **Column types**
 `int` · `float` · `bool` · `date` · `text` · `empty`, inferred with a 95%
@@ -311,13 +358,13 @@ Three things make it fast:
 python -m unittest discover -s tests -v
 ```
 
-116 tests covering encoding detection, delimiter sniffing, type inference,
+129 tests covering encoding detection, delimiter sniffing, type inference,
 statistics correctness, correlation, streaming-vs-one-shot equivalence,
-reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, quality checks, cleaning, xlsx parsing, HTML escaping, and
+reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, quality checks, cleaning, xlsx parsing, HTML escaping, and
 CLI exit codes.
 
 ```
-Ran 116 tests in 7.26s
+Ran 129 tests in 7.68s
 
 OK
 ```

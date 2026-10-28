@@ -62,6 +62,18 @@ jobs:
           fi
           echo "OK: no external references"
 
+      - name: Emits DDL for every dialect
+        shell: bash
+        run: |
+          for dialect in postgres mysql sqlite; do
+            python dataloupe.py examples/sales.csv --no-color --sql "$dialect" > "schema-$dialect.sql"
+            grep -q "CREATE TABLE" "schema-$dialect.sql"
+            echo "::group::$dialect"
+            cat "schema-$dialect.sql"
+            echo "::endgroup::"
+          done
+          echo "OK: three dialects"
+
       - name: Survives a legacy Windows code page
         if: runner.os == 'Windows'
         shell: bash

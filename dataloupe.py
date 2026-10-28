@@ -88,6 +88,35 @@ DEDUP_CAP = 200_000
 #: always print the same numbers.
 RESERVOIR_SEED = 0x0DA7A10
 
+#: How each inferred column type maps onto a SQL type, per dialect.
+#: SQLite has no date or boolean storage class, so those become TEXT/INTEGER.
+SQL_TYPES = {
+    "postgres": {
+        "int": "BIGINT", "float": "DOUBLE PRECISION", "bool": "BOOLEAN",
+        "date": "DATE", "datetime": "TIMESTAMP", "text": "TEXT", "empty": "TEXT",
+    },
+    "mysql": {
+        "int": "BIGINT", "float": "DOUBLE", "bool": "TINYINT(1)",
+        "date": "DATE", "datetime": "DATETIME", "text": "TEXT", "empty": "TEXT",
+    },
+    "sqlite": {
+        "int": "INTEGER", "float": "REAL", "bool": "INTEGER",
+        "date": "TEXT", "datetime": "TEXT", "text": "TEXT", "empty": "TEXT",
+    },
+}
+
+#: Words that have to be quoted to work as column names.
+SQL_RESERVED = {
+    "all", "and", "as", "asc", "between", "by", "case", "cast", "check",
+    "column", "constraint", "create", "cross", "current_date", "current_time",
+    "default", "delete", "desc", "distinct", "drop", "else", "end", "exists",
+    "false", "from", "full", "group", "having", "in", "index", "inner",
+    "insert", "into", "is", "join", "key", "left", "like", "limit", "not",
+    "null", "offset", "on", "or", "order", "outer", "primary", "references",
+    "right", "select", "set", "table", "then", "true", "union", "unique",
+    "update", "user", "using", "values", "when", "where", "with",
+}
+
 INT_RE = re.compile(r"^[+-]?\d{1,20}$")
 FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?$")
 
@@ -205,6 +234,27 @@ def is_missing(value: str) -> bool:
     if len(text) > 8:
         return False
     return text.lower() in MISSING_TOKENS
+
+
+def looks_like_formula(text: str) -> bool:
+    """True if a spreadsheet would try to execute this cell.
+
+    Excel, LibreOffice and Google Sheets all treat a leading ``=`` or ``@`` as
+    the start of a formula, and ``+`` / ``-`` as a legacy way to write one. A
+    CSV exported from a web form and then opened in Excel can therefore run
+    ``=cmd|'/C calc'!A0`` on the reader's machine — CSV injection.
+
+    Plain numbers start with ``+`` or ``-`` too, so those are excluded: the
+    test is "starts like a formula and is not a number".
+    """
+    head = text[:1]
+    if not head:
+        return False
+    if head in ("=", "@"):
+        return True
+    if head in ("+", "-"):
+        return _to_number(text) is None
+    return False
 
 
 def has_fullwidth_ascii(text: str) -> bool:
@@ -890,6 +940,7 @@ class ColumnProfile:
     trailing_space: int = 0
     fullwidth: int = 0
     control_chars: int = 0
+    formula_cells: int = 0
     empty_name: bool = False
     duplicate_name: bool = False
     raw_name: str = ""
@@ -1011,6 +1062,7 @@ class ColumnAccumulator:
         "_sample", "_seen", "_rng", "_w", "_next",
         "_date_min", "_date_max", "_formats", "_ambiguous", "_dated",
         "_hygiene_seen", "_leading", "_trailing", "_fullwidth", "_control",
+        "_formula",
     )
 
     def __init__(self, name: str, index: int) -> None:
@@ -1055,6 +1107,7 @@ class ColumnAccumulator:
         self._trailing = 0
         self._fullwidth = 0
         self._control = 0
+        self._formula = 0
 
     # -- ingest ------------------------------------------------------------
 
@@ -1090,7 +1143,7 @@ class ColumnAccumulator:
 
         if self._hygiene_seen < HYGIENE_SAMPLE:
             self._hygiene_seen += 1
-            self._check_hygiene(value)
+            self._check_hygiene(value, text)
 
         if self.kind is None:
             self._head.append(text)
@@ -1164,7 +1217,9 @@ class ColumnAccumulator:
         if length > self._max_len:
             self._max_len = length
 
-    def _check_hygiene(self, value: str) -> None:
+    def _check_hygiene(self, value: str, text: str) -> None:
+        if looks_like_formula(text):
+            self._formula += 1
         if value[:1].isspace():
             self._leading += 1
         if value[-1:].isspace():
@@ -1219,6 +1274,7 @@ class ColumnAccumulator:
         col.trailing_space = self._trailing
         col.fullwidth = self._fullwidth
         col.control_chars = self._control
+        col.formula_cells = self._formula
 
         if col.kind in ("int", "float"):
             if self._n:
@@ -1380,6 +1436,21 @@ def find_issues(profile: Profile) -> list[Issue]:
                                 column=col.raw_name,
                                 suggestion="重命名后重新导出，否则按列名取值只会拿到其中一列"))
 
+    # Names that differ only by case collide in every case-insensitive system:
+    # SQL Server, Excel headers, and most ORMs.
+    spellings: dict[str, list[str]] = {}
+    for col in profile.columns:
+        if col.raw_name and not col.duplicate_name:
+            spellings.setdefault(col.raw_name.lower(), []).append(col.raw_name)
+    for group in spellings.values():
+        if len(set(group)) > 1:
+            joined = "、".join(sorted(set(group)))
+            issues.append(Issue("medium", "列名仅大小写不同",
+                                f"{joined} 同时存在",
+                                column=group[0],
+                                suggestion="SQL Server、Excel、多数 ORM 不区分大小写，"
+                                           "这两列会被当成同一列"))
+
     for col in profile.columns:
         label = col.name or f"第{col.index + 1}列"
 
@@ -1387,6 +1458,15 @@ def find_issues(profile: Profile) -> list[Issue]:
             issues.append(Issue("high", "整列为空", f"「{label}」没有任何数据", column=col.name,
                                 suggestion="确认这列是否应该存在"))
             continue
+
+        if col.formula_cells:
+            issues.append(Issue(
+                "medium", "存在可被 Excel 执行的单元格",
+                f"「{label}」有 {col.formula_cells} 个值以 = + - @ 开头（如 =cmd|'/C calc'!A0）",
+                column=col.name,
+                suggestion="这类 CSV 注入在 Excel / WPS 里打开时会当成公式执行；"
+                           "导入时选「作为文本」，或让导出方在值前加单引号",
+            ))
 
         if col.missing_rate >= 0.5:
             issues.append(Issue("high", "缺失严重",
@@ -2174,6 +2254,10 @@ def render_json(profile: Profile) -> str:
         "duplicate_rows": profile.duplicate_rows,
         "ragged_rows": profile.ragged_rows,
         "empty_rows": profile.empty_rows,
+        # Anything that limits how much of the file was examined, so a consumer
+        # can tell an exact answer from a bounded one.
+        "truncated": profile.truncated,
+        "duplicate_scan_capped": profile.duplicate_scan_capped,
         "issues": [
             {"severity": i.severity, "title": i.title, "detail": i.detail,
              "column": i.column, "suggestion": i.suggestion}
@@ -2197,6 +2281,54 @@ def render_json(profile: Profile) -> str:
         ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# SQL schema output
+# ---------------------------------------------------------------------------
+
+def quote_identifier(name: str, dialect: str) -> str:
+    """Quote a name unless it is a plain lowercase identifier.
+
+    Quoting everything works but reads badly; leaving everything unquoted
+    breaks on ``Order`` or ``我的列``. So: quote only when needed.
+    """
+    if re.fullmatch(r"[a-z_][a-z0-9_]*", name) and name not in SQL_RESERVED:
+        return name
+    quote = "`" if dialect == "mysql" else '"'
+    return quote + name.replace(quote, quote * 2) + quote
+
+
+def sql_type_for(col: ColumnProfile, dialect: str) -> str:
+    """Map an inferred column type onto a SQL type for *dialect*."""
+    kind = col.kind
+    # A date column that also holds times needs a timestamp, not a date.
+    if kind == "date" and any("HH" in shape for shape in col.date_formats):
+        kind = "datetime"
+    return SQL_TYPES[dialect][kind]
+
+
+def render_sql(profile: Profile, dialect: str, table: str | None = None) -> str:
+    """A CREATE TABLE statement built from the inferred column types."""
+    if dialect not in SQL_TYPES:
+        raise ValueError(f"不支持的方言 / unknown dialect: {dialect}")
+
+    name = table or Path(profile.path).stem or "data"
+    types = [sql_type_for(col, dialect) for col in profile.columns]
+    identifiers = [quote_identifier(col.name, dialect) for col in profile.columns]
+    name_width = max(display_width(i) for i in identifiers)
+
+    body = ",\n".join(
+        f"    {pad(ident, name_width)}  {kind}"
+        for ident, kind in zip(identifiers, types)
+    )
+    return (
+        f"-- dataloupe {__version__} · {Path(profile.path).name} · "
+        f"{profile.rows:,} rows × {profile.cols} columns\n"
+        f"CREATE TABLE {quote_identifier(name, dialect)} (\n"
+        f"{body}\n"
+        f");"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2398,6 +2530,7 @@ def build_parser() -> argparse.ArgumentParser:
                "  dataloupe data.csv\n"
                "  dataloupe data.csv -o report.html\n"
                "  dataloupe data.xlsx --json\n"
+               "  dataloupe data.csv --sql postgres\n"
                "  dataloupe big.csv --limit 100000",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2416,6 +2549,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="配合 --fix：不重命名空列名和重复列名")
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="输出 JSON（便于脚本处理）")
+    parser.add_argument("--sql", metavar="DIALECT", choices=sorted(SQL_TYPES),
+                        help="按推断出的类型输出 CREATE TABLE 语句（postgres/mysql/sqlite）")
+    parser.add_argument("--table", metavar="NAME", default=None,
+                        help="配合 --sql：表名（默认取文件名）")
     parser.add_argument("--preview", action="store_true",
                         help="终端里额外打印前 20 行数据")
     parser.add_argument("--limit", type=int, default=None, metavar="N",
@@ -2467,6 +2604,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.as_json:
         print(render_json(profile))
+        return 0
+
+    if args.sql:
+        print(render_sql(profile, args.sql, args.table))
         return 0
 
     print(render_terminal(profile, show_preview=args.preview))
