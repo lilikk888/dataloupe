@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Iterator
 from xml.etree import ElementTree as ET
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -2546,6 +2546,280 @@ def _configure_output() -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# Schema & data drift between two exports
+# ---------------------------------------------------------------------------
+
+#: Column kinds a downstream numeric reader can treat interchangeably. A column
+#: moving int -> float (or back) is a widening, not a break: both flow through
+#: ``float()`` without complaint. Anything else is a schema break.
+_NUMERIC_KINDS = frozenset({"int", "float"})
+
+
+@dataclass
+class SchemaDiff:
+    old_path: str
+    new_path: str
+    old_rows: int
+    new_rows: int
+    old_encoding: str
+    new_encoding: str
+    old_cols: int
+    new_cols: int
+    added: list[str]
+    removed: list[str]
+    renamed: list[tuple[str, str]]
+    type_changes: list[tuple[str, str, str, bool]]
+    type_inconsistencies: list[tuple[str, float, float]]
+    quality_regressions: list[tuple[str, float, float]]
+    drift: bool
+    breaking: bool
+
+
+def diff_profiles(old: "Profile", new: "Profile") -> SchemaDiff:
+    """Compare two profiles of the *same* logical dataset at different times.
+
+    The headline cases are the ones that silently break a pipeline: a column
+    renamed, a column dropped, a numeric column that turned into text because
+    someone typed "N/A" into it, a date column that stopped parsing. Row counts
+    and encodings are reported too, because a switch from UTF-8 to GBK is also
+    a change nobody asked for.
+    """
+    old_cols = {c.name: c for c in old.columns}
+    new_cols = {c.name: c for c in new.columns}
+
+    added = [n for n in new_cols if n not in old_cols]
+    removed = [n for n in old_cols if n not in new_cols]
+    shared = [n for n in new_cols if n in old_cols]
+
+    type_changes = []
+    type_inconsistencies = []
+    quality_regressions = []
+    for name in shared:
+        oc, nc = old_cols[name], new_cols[name]
+        if oc.kind != nc.kind:
+            breaking = not (oc.kind in _NUMERIC_KINDS and nc.kind in _NUMERIC_KINDS)
+            type_changes.append((name, oc.kind, nc.kind, breaking))
+
+        # A column can keep its inferred type yet start swallowing dirty values
+        # (an "N/A" that was not a missing token, a "TBD", a stray letter). The
+        # kind stays put but the share of values that do not parse as that type
+        # jumps — exactly the kind of quiet corruption a drift check exists to
+        # catch, so track the mismatch rate separately from the type itself.
+        old_mr = oc.mismatch / oc.total if oc.total else 0.0
+        new_mr = nc.mismatch / nc.total if nc.total else 0.0
+        if new_mr - old_mr >= 0.1 or (old_mr == 0.0 and new_mr > 0.0):
+            type_inconsistencies.append((name, old_mr, new_mr))
+
+        old_rate = oc.missing / oc.total if oc.total else 0.0
+        new_rate = nc.missing / nc.total if nc.total else 0.0
+        if new_rate - old_rate >= 0.1 or (old_rate == 0.0 and new_rate > 0.0):
+            quality_regressions.append((name, old_rate, new_rate))
+
+    renamed = _guess_renames(removed, added, old_cols, new_cols)
+
+    # A guessed rename is one drop + one add with the same underlying column, so
+    # take them back out of the plain added/removed lists to avoid double noise.
+    renamed_old = {o for o, _ in renamed}
+    renamed_new = {n for _, n in renamed}
+    added = [n for n in added if n not in renamed_new]
+    removed = [n for n in removed if n not in renamed_old]
+
+    encoding_changed = old.encoding != new.encoding
+    drift = bool(added or removed or renamed or type_changes
+                 or type_inconsistencies or quality_regressions
+                 or encoding_changed or old.rows != new.rows)
+    breaking = bool(
+        removed
+        or encoding_changed
+        or quality_regressions
+        or type_inconsistencies
+        or any(b for (_, _, _, b) in type_changes)
+    )
+
+    return SchemaDiff(
+        old_path=old.path, new_path=new.path,
+        old_rows=old.rows, new_rows=new.rows,
+        old_encoding=old.encoding, new_encoding=new.encoding,
+        old_cols=old.cols, new_cols=new.cols,
+        added=added, removed=removed, renamed=renamed,
+        type_changes=type_changes, type_inconsistencies=type_inconsistencies,
+        quality_regressions=quality_regressions,
+        drift=drift, breaking=breaking,
+    )
+
+
+def _guess_renames(removed: list[str], added: list[str],
+                   old_cols: dict[str, "ColumnProfile"],
+                   new_cols: dict[str, "ColumnProfile"]) -> list[tuple[str, str]]:
+    """Pair dropped and new columns that look like the same column renamed.
+
+    A rename is *guessed*, never asserted: it fires only when the old and new
+    names are close (edit distance <= 2, or one contains the other) AND the
+    inferred types agree. Real renames without those hints stay reported as a
+    plain drop plus add, which is the honest thing to do.
+    """
+    if not removed or not added:
+        return []
+
+    candidates = []
+    for o in removed:
+        for n in added:
+            if old_cols[o].kind != new_cols[n].kind:
+                continue
+            lo, ln = o.lower(), n.lower()
+            if lo == ln:
+                continue
+            dist = _edit_distance(lo, ln)
+            # Containment is a strong rename signal even across length ("id" in
+            # "user_id"); require the contained token to be at least two chars so
+            # a stray single letter never matches. Plain near-misses below edit
+            # distance 2 only count once both names are long enough that a two-
+            # character difference is unlikely to be coincidence.
+            contained = (len(lo) >= 2 and lo in ln) or (len(ln) >= 2 and ln in lo)
+            if contained or (len(lo) >= 3 and len(ln) >= 3 and dist <= 2):
+                candidates.append((dist, o, n))
+    candidates.sort()
+
+    seen_old: set[str] = set()
+    seen_new: set[str] = set()
+    pairs = []
+    for _, o, n in candidates:
+        if o in seen_old or n in seen_new:
+            continue
+        seen_old.add(o)
+        seen_new.add(n)
+        pairs.append((o, n))
+    return pairs
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance with a flat row-vector (no full matrix)."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for ca in a:
+        cur = [prev[0] + 1]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost))
+        prev = cur
+    return prev[-1]
+
+
+def render_diff_terminal(diff: SchemaDiff, strict: bool = False) -> str:
+    lines: list[str] = []
+    lines.append("")
+    lines.append("  " + bold("dataloupe") + dim(f"  v{__version__}") + "  " + bold("数据漂移对比"))
+    lines.append("")
+    lines.append("  " + bold(Path(diff.new_path).name))
+    lines.append("  " + dim(f"{Path(diff.old_path).name} -> {Path(diff.new_path).name}"))
+    lines.append("")
+
+    delta = diff.new_rows - diff.old_rows
+    sign = "+" if delta >= 0 else ""
+    lines.append(f"  行数  {diff.old_rows:,} -> {diff.new_rows:,}  ({sign}{delta:,})")
+    lines.append(f"  列数  {diff.old_cols} -> {diff.new_cols}")
+    if diff.old_encoding != diff.new_encoding:
+        lines.append("  编码  " + tint(f"{diff.old_encoding} -> {diff.new_encoding}", "33") + "  ⚠")
+    lines.append("")
+
+    if not diff.drift:
+        lines.append("  " + tint("✓ 两份文件结构一致，未发现漂移。", "32"))
+        lines.append("")
+        return "\n".join(lines)
+
+    if diff.added:
+        w = max(display_width(n) for n in diff.added)
+        lines.append("  " + bold("新增列（建议确认来源）"))
+        for name in diff.added:
+            lines.append("    + " + tint(pad(name, w), "32"))
+        lines.append("")
+
+    if diff.removed:
+        w = max(display_width(n) for n in diff.removed)
+        lines.append("  " + bold("删除列（下游若有引用会报错）"))
+        for name in diff.removed:
+            lines.append("    - " + tint(pad(name, w), "31"))
+        lines.append("")
+
+    if diff.renamed:
+        w = max(display_width(f"{o} -> {n}") for o, n in diff.renamed)
+        lines.append("  " + bold("疑似重命名（类型一致，名称相近）"))
+        for old, new in diff.renamed:
+            lines.append("    ~ " + pad(f"{old} -> {new}", w))
+        lines.append("")
+
+    breaking = [(n, o, nw) for (n, o, nw, b) in diff.type_changes if b]
+    benign = [(n, o, nw) for (n, o, nw, b) in diff.type_changes if not b]
+    if breaking:
+        w = max(display_width(n) for n, _, _ in breaking)
+        lines.append("  " + bold("类型变更 · 破坏性（下游会报错或算错）"))
+        for name, o, nw in breaking:
+            lines.append("    ! " + pad(name, w) + "  " + tint(f"{o} -> {nw}", "31"))
+        lines.append("")
+    if benign:
+        w = max(display_width(n) for n, _, _ in benign)
+        lines.append("  " + bold("类型变更 · 兼容（仍可读）"))
+        for name, o, nw in benign:
+            lines.append("    ~ " + pad(name, w) + "  " + dim(f"{o} -> {nw}"))
+        lines.append("")
+
+    if diff.type_inconsistencies:
+        w = max(display_width(n) for n, _, _ in diff.type_inconsistencies)
+        lines.append("  " + bold("类型污染（混入无法解析的值）"))
+        for name, o, nw in diff.type_inconsistencies:
+            lines.append("    ! " + pad(name, w) + "  " + tint(f"{o:.1%} -> {nw:.1%}", "31"))
+        lines.append("")
+
+    if diff.quality_regressions:
+        w = max(display_width(n) for n, _, _ in diff.quality_regressions)
+        lines.append("  " + bold("质量退化（缺失率上升）"))
+        for name, o, nw in diff.quality_regressions:
+            lines.append("    ↓ " + pad(name, w) + "  " + f"{o:.1%} -> {nw:.1%}")
+        lines.append("")
+
+    verdict = "破坏性变更" if diff.breaking else "非破坏性变更"
+    code = "31" if diff.breaking else "33"
+    lines.append("  " + tint(f"结论：{verdict}。" + ("--strict 下也会失败。" if strict and not diff.breaking else ""), code))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_diff_json(diff: SchemaDiff) -> str:
+    payload = {
+        "old_path": diff.old_path,
+        "new_path": diff.new_path,
+        "old_rows": diff.old_rows,
+        "new_rows": diff.new_rows,
+        "old_encoding": diff.old_encoding,
+        "new_encoding": diff.new_encoding,
+        "old_cols": diff.old_cols,
+        "new_cols": diff.new_cols,
+        "drift": diff.drift,
+        "breaking": diff.breaking,
+        "added": diff.added,
+        "removed": diff.removed,
+        "renamed": [{"from": o, "to": n} for o, n in diff.renamed],
+        "type_changes": [
+            {"column": n, "old": o, "new": nw, "breaking": b}
+            for (n, o, nw, b) in diff.type_changes
+        ],
+        "type_inconsistencies": [
+            {"column": n, "old_mismatch_rate": round(o, 4), "new_mismatch_rate": round(nw, 4)}
+            for (n, o, nw) in diff.type_inconsistencies
+        ],
+        "quality_regressions": [
+            {"column": n, "old_missing_rate": round(o, 4), "new_missing_rate": round(nw, 4)}
+            for (n, o, nw) in diff.quality_regressions
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dataloupe",
@@ -2555,10 +2829,11 @@ def build_parser() -> argparse.ArgumentParser:
                "  dataloupe data.csv -o report.html\n"
                "  dataloupe data.xlsx --json\n"
                "  dataloupe data.csv --sql postgres\n"
-               "  dataloupe big.csv --limit 100000",
+               "  dataloupe big.csv --limit 100000\n"
+               "  dataloupe old.csv new.csv --diff",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("file", help="要分析的文件（csv/tsv/jsonl/json/xlsx）")
+    parser.add_argument("files", nargs="+", help="要分析的文件；配合 --diff 时给两个（旧文件 新文件）")
     parser.add_argument("-o", "--output", metavar="PATH",
                         help="HTML 报告路径；配合 --fix 时是清洗后的数据路径")
     parser.add_argument("--fix", action="store_true",
@@ -2583,6 +2858,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="最多读取 N 行（大文件快速抽样）")
     parser.add_argument("--fail-under", type=int, default=None, metavar="SCORE",
                         help="评分低于 SCORE 时以退出码 1 结束（配合 CI 用）")
+    parser.add_argument("--diff", action="store_true",
+                        help="对比两个文件的结构与数据质量漂移（需两个文件）")
+    parser.add_argument("--strict", action="store_true",
+                        help="配合 --diff：连新增列、疑似重命名、兼容类型变更也判为失败")
     parser.add_argument("--no-color", action="store_true", help="关闭颜色")
     parser.add_argument("--version", action="version", version=f"dataloupe {__version__}")
     return parser
@@ -2604,6 +2883,43 @@ def _write_or_report(target: Path, write) -> bool:
     return True
 
 
+def _run_diff(args: argparse.Namespace) -> int:
+    """Compare two exports and report what drifted. See :func:`diff_profiles`."""
+    if len(args.files) != 2:
+        print("错误：--diff 需要两个文件（旧文件 新文件）", file=sys.stderr)
+        return 2
+    if args.fix or args.sql or args.output:
+        print("错误：--diff 不支持 --fix / --sql / -o", file=sys.stderr)
+        return 2
+
+    paths = [Path(p).expanduser() for p in args.files]
+    profiles = []
+    for path in paths:
+        try:
+            profiles.append(analyse(path, limit=args.limit))
+        except FileNotFoundError as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+            return 2
+        except (ValueError, OSError, zipfile.BadZipFile) as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            return 130
+
+    old_profile, new_profile = profiles
+    diff = diff_profiles(old_profile, new_profile)
+
+    if args.as_json:
+        print(render_diff_json(diff))
+    else:
+        print(render_diff_terminal(diff, strict=args.strict))
+
+    # A breaking change fails the build by default; --strict also fails on any
+    # drift at all (added columns, renames, compatible type widening).
+    failed = diff.breaking or (args.strict and diff.drift)
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _configure_output()
     args = build_parser().parse_args(argv)
@@ -2615,7 +2931,14 @@ def main(argv: list[str] | None = None) -> int:
         # Turn on ANSI escape processing for classic conhost.
         os.system("")
 
-    path = Path(args.file).expanduser()
+    if args.diff:
+        return _run_diff(args)
+
+    if len(args.files) != 1:
+        print("错误：单文件模式只接受一个文件（对比两个文件请用 --diff）", file=sys.stderr)
+        return 2
+
+    path = Path(args.files[0]).expanduser()
 
     try:
         profile = analyse(path, limit=args.limit)

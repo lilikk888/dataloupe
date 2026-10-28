@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.2.0
+
+Two-file schema drift detection, plus input hardening.
+
+**`--diff OLD NEW` compares two exports of the same table and reports what
+moved.** This is the change that breaks a pipeline without anyone noticing: a
+column renamed, a column dropped, a numeric column that turned into text
+because someone typed "TBD" into it, a date column that stopped parsing. The
+check catches:
+
+- Columns added and removed.
+- **Likely renames** — a near name with the same inferred type (`price` ->
+  `unit_price`) is guessed as one rename rather than a drop plus add. Names must
+  share a token (containment) or be within two edits once both are reasonably
+  long, to avoid false positives.
+- **Type pollution** — the inferred type stays put, but the share of values that
+  no longer parse as that type jumps (a "N/A" that was not a missing token, a
+  stray letter). The kind does not change, so a plain type-equality check would
+  miss it; the mismatch rate is tracked separately.
+- Quality regressions — a column's missing rate climbs.
+- Encoding changes.
+
+Exit codes follow the CI gate: a **breaking** change (removed column, type
+pollution, quality regression, encoding change) fails; only-added, a likely
+rename, or an `int` <-> `float` widening does not. `--strict` fails on any drift.
+`--diff --json` emits machine-readable output.
+
+**Fixes**
+
+- A header row with no data, a flat JSON array, an empty file, and `--fix`
+  pointed at its own input (which used to clobber the source) are now handled
+  instead of crashing.
+- Rename detection no longer pairs two single-character columns that simply
+  differ in one letter.
+
 ## 1.1.0
 
 Streaming rewrite, plus three new findings.

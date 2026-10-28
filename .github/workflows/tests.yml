@@ -74,6 +74,12 @@ jobs:
           done
           echo "OK: three dialects"
 
+      - name: Drift detection runs on a two-file example
+        shell: bash
+        run: |
+          python dataloupe.py examples/customers_old.csv examples/customers_new.csv --diff --no-color
+          echo "OK: diff path exercised"
+
       - name: Survives a legacy Windows code page
         if: runner.os == 'Windows'
         shell: bash

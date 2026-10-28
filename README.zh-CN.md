@@ -95,6 +95,9 @@ python dataloupe.py huge.csv --limit 100000
 # 直接生成建表语句
 python dataloupe.py data.csv --sql postgres
 
+# 对比两份导出，抓结构漂移（新列 / 删列 / 重命名 / 类型变了）
+python dataloupe.py last_week.csv today.csv --diff
+
 # 修好数据另存一份（原文件不动）
 python dataloupe.py data.csv --fix
 ```
@@ -193,6 +196,47 @@ CREATE TABLE sales (
 带时间的日期会自动升成 `TIMESTAMP`。列名不是纯小写标识符（`Order`、`客户名称`、
 `user` 这种关键字）会自动加引号，MySQL 用反引号。表名默认取文件名，
 `--table events` 可以改。
+
+---
+
+## Schema 漂移对比
+
+数据管道最安静的事故：半夜的自动导出改了结构，下游代码要么报错，要么**静默算错**。
+`--diff` 拿两份"应该是同一张表"的快照比一比，把变化说清楚：
+
+```bash
+python dataloupe.py last_week.csv today.csv --diff
+```
+
+```text
+  新增列（建议确认来源）
+    + country
+
+  疑似重命名（类型一致，名称相近）
+    ~ price -> unit_price
+
+  类型污染（混入无法解析的值）
+    ! qty  0.0% -> 20.0%
+
+  质量退化（缺失率上升）
+    ↓ note  0.0% -> 40.0%
+
+  结论：破坏性变更。
+```
+
+它会抓这些事：
+
+| 信号 | 含义 |
+|---|---|
+| 新增列 / 删除列 | 下游若有按列名取值的代码，删列会直接崩 |
+| **疑似重命名** | 类型一致、名称相近（如 `price` → `unit_price`）被猜成同一列重命名，而不是"删一个加一个" |
+| 类型变更 | `int` → `text` 这种破坏性变更；`int` ↔ `float` 算兼容 |
+| **类型污染** | 列类型没变，但混入解析不了的值（`TBD`、`N/A`）——这种最容易漏 |
+| 质量退化 | 某列缺失率明显上升 |
+
+退出码遵循 CI 门禁逻辑：**破坏性变更（删列 / 类型污染 / 质量退化 / 编码变化）直接失败**；
+只多了列、或只是疑似重命名、或只是 `int`↔`float` 这类兼容变化时**不失败**。
+加 `--strict` 则任何漂移都失败。也能 `--diff --json` 给程序消费。
 
 ---
 
@@ -347,12 +391,12 @@ for row in rows:              # 一次只持有一行
 python -m unittest discover -s tests -v
 ```
 
-131 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
+146 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
 流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、退出码与 CI 门禁、质量检测、数据清洗、
-xlsx 解析、HTML 转义、CLI 退出码。
+xlsx 解析、HTML 转义、CLI 退出码、两文件 schema 漂移对比（增删列、疑似重命名、类型污染、质量退化）。
 
 ```
-Ran 131 tests in 7.21s
+Ran 146 tests in 7.94s
 
 OK
 ```

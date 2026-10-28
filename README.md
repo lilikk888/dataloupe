@@ -203,6 +203,49 @@ defaults to the file name; `--table events` overrides it.
 
 ---
 
+## Schema drift between two exports
+
+The quietest data-pipeline accident is an overnight export that changed shape:
+downstream code either crashes or, worse, **silently computes the wrong answer**.
+`--diff` takes two snapshots of what should be the same table and says what moved:
+
+```bash
+python dataloupe.py last_week.csv today.csv --diff
+```
+
+```text
+  新增列（建议确认来源）
+    + country
+
+  疑似重命名（类型一致，名称相近）
+    ~ price -> unit_price
+
+  类型污染（混入无法解析的值）
+    ! qty  0.0% -> 20.0%
+
+  质量退化（缺失率上升）
+    ↓ note  0.0% -> 40.0%
+
+  结论：破坏性变更。
+```
+
+What it catches:
+
+| Signal | Meaning |
+|---|---|
+| Added / removed columns | Code that reads by name breaks the moment a column vanishes |
+| **Likely rename** | A near-name with the same type (`price` -> `unit_price`) is guessed as one rename, not a drop plus add |
+| Type change | `int` -> `text` is breaking; `int` <-> `float` is treated as compatible |
+| **Type pollution** | The inferred type stays put but unparseable values (`TBD`, `N/A`) creep in — the easiest one to miss |
+| Quality regression | A column's missing rate climbs sharply |
+
+Exit codes follow the CI gate: a **breaking** change (removed column, type
+pollution, quality regression, encoding change) fails; only-added, a likely
+rename, or an `int`<->`float` widening does not. Add `--strict` to fail on any
+drift at all. `--diff --json` feeds a program instead.
+
+---
+
 ## Correlations
 
 Every pair of numeric columns gets a Pearson correlation. Pairs above |r| ≥ 0.5
@@ -368,13 +411,13 @@ Three things make it fast:
 python -m unittest discover -s tests -v
 ```
 
-131 tests covering encoding detection, delimiter sniffing, type inference,
+146 tests covering encoding detection, delimiter sniffing, type inference,
 statistics correctness, correlation, streaming-vs-one-shot equivalence,
 reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, exit codes, quality checks, cleaning, xlsx parsing, HTML escaping, and
-CLI exit codes.
+two-file schema drift (added/removed columns, likely renames, type pollution, quality regression).
 
 ```
-Ran 131 tests in 7.21s
+Ran 146 tests in 7.94s
 
 OK
 ```

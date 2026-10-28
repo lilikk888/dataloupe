@@ -1026,5 +1026,100 @@ class TestEdgeCases(unittest.TestCase):
             dl.analyse(path)
 
 
+class TestDiff(unittest.TestCase):
+    """Comparing two exports of the same logical table is its own feature."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def test_same_file_has_no_drift(self):
+        path = self.directory / "same.csv"
+        path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+        diff = dl.diff_profiles(dl.analyse(path), dl.analyse(path))
+        self.assertFalse(diff.drift)
+        self.assertFalse(diff.breaking)
+
+    def test_detects_added_and_removed_columns(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+        new.write_text("a,b,d\n1,2,4\n", encoding="utf-8")
+        diff = dl.diff_profiles(dl.analyse(old), dl.analyse(new))
+        self.assertEqual(diff.removed, ["c"])
+        self.assertEqual(diff.added, ["d"])
+        self.assertTrue(diff.drift)
+
+    def test_renames_are_guessed_from_name_and_type(self):
+        # price -> unit_price keeps the type and contains the old name.
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("id,price\n1,10.0\n", encoding="utf-8")
+        new.write_text("id,unit_price\n1,10.0\n", encoding="utf-8")
+        diff = dl.diff_profiles(dl.analyse(old), dl.analyse(new))
+        self.assertEqual(diff.renamed, [("price", "unit_price")])
+        self.assertEqual(diff.added, [])
+        self.assertEqual(diff.removed, [])
+
+    def test_unrelated_drop_and_add_are_not_a_rename(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("id,alpha\n1,10\n", encoding="utf-8")
+        new.write_text("id,beta\n1,10\n", encoding="utf-8")
+        diff = dl.diff_profiles(dl.analyse(old), dl.analyse(new))
+        self.assertEqual(diff.renamed, [])
+        self.assertEqual(diff.removed, ["alpha"])
+        self.assertEqual(diff.added, ["beta"])
+
+    def test_breaking_type_change_is_flagged(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        # n is clean int in the old file; a "TBD" appears in the new one, so the
+        # inferred kind stays int (plurality) but the mismatch rate jumps -- the
+        # quiet corruption a drift check exists to catch.
+        old.write_text("a,n\n1,5\n2,6\n", encoding="utf-8")
+        new.write_text("a,n\n1,5\n2,TBD\n", encoding="utf-8")
+        diff = dl.diff_profiles(dl.analyse(old), dl.analyse(new))
+        names = [c[0] for c in diff.type_inconsistencies]
+        self.assertIn("n", names)
+        self.assertTrue(diff.breaking)
+
+    def test_quality_regression_on_missing_rate(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("a,b\n1,x\n2,y\n3,z\n", encoding="utf-8")
+        new.write_text("a,b\n1,x\n2,\n3,\n", encoding="utf-8")
+        diff = dl.diff_profiles(dl.analyse(old), dl.analyse(new))
+        names = [c[0] for c in diff.quality_regressions]
+        self.assertIn("b", names)
+        self.assertTrue(diff.breaking)
+
+    def test_non_breaking_drift_exits_zero_unless_strict(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("a,b\n1,2\n", encoding="utf-8")
+        new.write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+        old_p, new_p = dl.analyse(old), dl.analyse(new)
+        # Only an added column: a warning, not a break.
+        self.assertFalse(dl.diff_profiles(old_p, new_p).breaking)
+        self.assertEqual(dl.main([str(old), str(new), "--no-color", "--diff"]), 0)
+        self.assertEqual(
+            dl.main([str(old), str(new), "--no-color", "--diff", "--strict"]), 1)
+
+    def test_diff_reports_drift_in_cli(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("a,b\n1,2\n", encoding="utf-8")
+        new.write_text("b\n2\n", encoding="utf-8")
+        # column a removed -> breaking
+        self.assertEqual(dl.main([str(old), str(new), "--no-color", "--diff"]), 1)
+
+    def test_edit_distance(self):
+        self.assertEqual(dl._edit_distance("kitten", "sitting"), 3)
+        self.assertEqual(dl._edit_distance("price", "unit_price"), 5)
+        self.assertEqual(dl._edit_distance("abc", "abc"), 0)
+        self.assertEqual(dl._edit_distance("", "ab"), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
