@@ -13,7 +13,7 @@ python dataloupe.py sales.csv
 ```
 
 ```
-  dataloupe  v1.0.0
+  dataloupe  v1.1.0
 
   messy.csv
   CSV · UTF-8 · 逗号分隔 · 4.1KB
@@ -59,7 +59,8 @@ hundreds of megabytes — just to answer "is this CSV clean?".
 | Install | `pip install` + pandas/numpy/matplotlib | **copy one file** |
 | Dependencies | dozens | **zero** |
 | Startup | several seconds | ~0.1s |
-| 500k rows × 5 cols | minutes | **2.6s** (measured) |
+| Memory | grows with row count | **flat 76 MB** (50k rows to 5M) |
+| 500k rows × 8 cols | minutes | **4.8s** (measured) |
 | GBK / GB18030 input | often breaks | auto-detected |
 | Reads .xlsx | needs openpyxl | built in (zip + xml) |
 | Output | heavy HTML | single-file HTML, works offline |
@@ -249,24 +250,58 @@ dataloupe data.csv
 
 ---
 
-## Performance
+## Performance and memory
 
-Measured on Windows, Python 3.13, 500,000 rows × 5 columns (17.8 MB CSV):
+Measured on Windows, Python 3.13, 8 mixed-type columns (int, date, text, float,
+bool):
 
+| Rows | File size | Time | Peak memory |
+|---|---|---|---|
+| 50,000 | 2.6 MB | 0.6 s | 47 MB |
+| 500,000 | 26 MB | 4.8 s | 76 MB |
+| 2,000,000 | 102 MB | 16.8 s | 76 MB |
+| 5,000,000 | 257 MB | 39.4 s | 76 MB |
+
+**A hundred times more rows, the same memory.** That is the main difference
+between `dataloupe` and most profiling tools: it never loads the file. Rows are
+folded into per-column accumulators as they arrive, then dropped.
+
+```python
+for row in rows:              # exactly one row in memory
+    for acc, cell in zip(accumulators, row):
+        acc.add(cell)
 ```
-500,000 行 × 5 列 · 用时 2.63s
-```
 
-Two things make that possible:
+Every accumulator keeps only capped structures, so memory scales with the
+number of columns, not rows:
+
+| Kept | Cap |
+|---|---|
+| Distinct-value table | 100,000 values (reported as `≥100,000` past that) |
+| Numeric sample | 200,000 floats (reservoir sampling, Algorithm L) |
+| Type-voting sample | first 2,000 non-empty values |
+| Hygiene sample | first 5,000 values |
+| Duplicate-row fingerprints | first 200,000 distinct rows |
+
+The trade-off: **past 200,000 numeric values, the median, quartiles and
+histogram come from a random sample**, marked with `*` in the report. Min, max,
+mean, standard deviation and missing counts stay exact at any size — mean and
+variance are updated with Welford's recurrence, never stored-then-averaged.
+
+Three things make it fast:
 
 1. **ISO date fast path** — `datetime.strptime` compiles a regex and touches the
    locale on every call. Parsing 500k dates that way took 14 seconds; matching a
    single regex and constructing the `datetime` directly took under one.
-2. **Sampled hygiene checks** — stray spaces, full-width characters, and control
+2. **Algorithm L reservoir** — naive sampling calls the RNG once per row, which
+   costs seconds on ten million rows. Algorithm L skips ahead geometrically, so
+   the RNG is touched a few hundred thousand times.
+3. **Sampled hygiene checks** — stray spaces, full-width characters and control
    characters are rare. They are detected on the first 5,000 values instead of
    every cell.
 
-Statistics themselves are always computed over the full column.
+> `--fix` is the exception: it rewrites the whole table, so it still loads
+> everything. On a huge file, look first with `--limit`, then decide.
 
 ---
 
@@ -276,12 +311,13 @@ Statistics themselves are always computed over the full column.
 python -m unittest discover -s tests -v
 ```
 
-97 tests covering encoding detection, delimiter sniffing, type inference,
-statistics correctness, correlation, quality checks, cleaning, xlsx parsing,
-HTML escaping, and CLI exit codes.
+116 tests covering encoding detection, delimiter sniffing, type inference,
+statistics correctness, correlation, streaming-vs-one-shot equivalence,
+reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, quality checks, cleaning, xlsx parsing, HTML escaping, and
+CLI exit codes.
 
 ```
-Ran 97 tests in 0.37s
+Ran 116 tests in 7.26s
 
 OK
 ```

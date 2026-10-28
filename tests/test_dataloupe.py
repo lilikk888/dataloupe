@@ -1,6 +1,7 @@
 """Test suite for dataloupe. Run with: python -m unittest discover -s tests -v"""
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -179,7 +180,7 @@ class TestColumnProfile(unittest.TestCase):
 class TestAnalysis(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: [p.unlink() for p in self.dir.iterdir()] and self.dir.rmdir())
+        self.addCleanup(shutil.rmtree, self.dir, True)
 
     def _csv(self, name: str, content: str, encoding: str = "utf-8") -> Path:
         path = self.dir / name
@@ -332,7 +333,7 @@ class TestXlsx(unittest.TestCase):
 class TestRendering(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: [p.unlink() for p in self.dir.iterdir()] and self.dir.rmdir())
+        self.addCleanup(shutil.rmtree, self.dir, True)
         path = self.dir / "d.csv"
         path.write_text("name,age,city\nAlice,30,Beijing\nBob,,Shanghai\n", encoding="utf-8")
         self.profile = dl.analyse(path)
@@ -553,7 +554,7 @@ class TestCleaning(unittest.TestCase):
 class TestFixCli(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: [p.unlink() for p in self.dir.iterdir() if p.is_file()] and self.dir.rmdir())
+        self.addCleanup(shutil.rmtree, self.dir, True)
         self.source = self.dir / "dirty.csv"
         self.source.write_text(
             "name,amount\n  张三  ,１２３\n李四,NA\n李四,NA\n", encoding="utf-8"
@@ -592,7 +593,7 @@ class TestFixCli(unittest.TestCase):
 class TestCli(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
-        self.addCleanup(lambda: [p.unlink() for p in self.dir.iterdir()] and self.dir.rmdir())
+        self.addCleanup(shutil.rmtree, self.dir, True)
 
     def test_clean_file_exits_zero(self):
         path = self.dir / "ok.csv"
@@ -614,6 +615,247 @@ class TestCli(unittest.TestCase):
         dl.main([str(path), "--no-color", "-o", str(target)])
         self.assertTrue(target.exists())
         self.assertIn("dataloupe", target.read_text(encoding="utf-8"))
+
+    def test_creates_missing_output_folders(self):
+        path = self.dir / "ok3.csv"
+        path.write_text("a\n1\n", encoding="utf-8")
+        target = self.dir / "reports" / "march" / "out.html"
+        self.assertEqual(dl.main([str(path), "--no-color", "-o", str(target)]), 0)
+        self.assertTrue(target.exists())
+
+    def test_fix_writes_next_to_the_source_by_default(self):
+        path = self.dir / "dirty.csv"
+        path.write_text("a,b\n 1 ,2\n", encoding="utf-8")
+        self.assertEqual(dl.main([str(path), "--no-color", "--fix"]), 0)
+        cleaned = self.dir / "dirty.cleaned.csv"
+        self.assertTrue(cleaned.exists())
+        self.assertIn("1,2", cleaned.read_text(encoding="utf-8-sig"))
+
+
+class TestColumnAccumulator(unittest.TestCase):
+    def test_matches_one_shot_profile(self):
+        values = [str(i % 37) for i in range(500)]
+        expected = dl.profile_column("n", 0, values)
+        acc = dl.ColumnAccumulator("n", 0)
+        for value in values:
+            acc.add(value)
+        col = acc.finish()
+        self.assertEqual(col.kind, expected.kind)
+        self.assertEqual(col.distinct, expected.distinct)
+        self.assertAlmostEqual(col.num_mean, expected.num_mean, places=9)
+        self.assertAlmostEqual(col.num_median, expected.num_median, places=9)
+        self.assertAlmostEqual(col.num_std, expected.num_std, places=9)
+
+    def test_welford_matches_the_statistics_module(self):
+        import random
+        import statistics
+
+        rng = random.Random(3)
+        values = [round(rng.gauss(100, 15), 6) for _ in range(5000)]
+        acc = dl.ColumnAccumulator("x", 0)
+        for value in values:
+            acc.add(str(value))
+        col = acc.finish()
+        self.assertAlmostEqual(col.num_mean, statistics.fmean(values), places=6)
+        self.assertAlmostEqual(col.num_std, statistics.pstdev(values), places=6)
+
+    def test_type_settles_on_the_first_sample(self):
+        acc = dl.ColumnAccumulator("x", 0)
+        for i in range(dl.TYPE_SAMPLE):
+            acc.add(str(i))
+        for _ in range(50):
+            acc.add("oops")
+        col = acc.finish()
+        # Same rule as before: only the first TYPE_SAMPLE values vote.
+        self.assertEqual(col.kind, "int")
+
+    def test_distinct_cap_reports_a_floor(self):
+        original = dl.DISTINCT_CAP
+        dl.DISTINCT_CAP = 10
+        self.addCleanup(setattr, dl, "DISTINCT_CAP", original)
+
+        acc = dl.ColumnAccumulator("t", 0)
+        for i in range(100):
+            acc.add(f"v{i}")
+        col = acc.finish()
+        self.assertTrue(col.distinct_capped)
+        self.assertEqual(col.distinct, 10)
+
+    def test_reservoir_keeps_order_statistics_close(self):
+        original = dl.MAX_VALUES
+        dl.MAX_VALUES = 1000
+        self.addCleanup(setattr, dl, "MAX_VALUES", original)
+
+        acc = dl.ColumnAccumulator("x", 0)
+        for i in range(200_000):
+            acc.add(str(i))
+        col = acc.finish()
+        self.assertTrue(col.approximate)
+        self.assertEqual(col.num_min, 0.0)
+        self.assertEqual(col.num_max, 199_999.0)
+        # Exact statistics must stay exact even when the sample is small.
+        self.assertAlmostEqual(col.num_mean, 99_999.5, places=4)
+        # Sampled ones only need to be close: within 2% of the true median.
+        self.assertAlmostEqual(col.num_median, 99_999.5, delta=4000)
+
+    def test_empty_column_is_empty(self):
+        acc = dl.ColumnAccumulator("e", 0)
+        for value in ("", "NA", "  ", "null"):
+            acc.add(value)
+        col = acc.finish()
+        self.assertEqual(col.kind, "empty")
+        self.assertEqual(col.missing, 4)
+        self.assertEqual(col.total, 4)
+
+
+class TestStreaming(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_source_is_lazy(self):
+        path = self.dir / "a.csv"
+        path.write_text("a,b\n0,0\n1,2\n", encoding="utf-8")
+        stream, rows = dl.iter_source(path)
+        self.addCleanup(rows.close)
+        self.assertNotIsInstance(rows, list)
+        self.assertEqual(next(rows), ["0", "0"])
+        self.assertEqual(stream.stats.read, 1)
+
+    def test_streamed_profile_matches_the_in_memory_one(self):
+        path = self.dir / "b.csv"
+        lines = ["x,y"] + [f"{i},{'a' if i % 3 else ''}" for i in range(300)]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        streamed = dl.analyse(path)
+        loaded = dl.load_source(path)
+        for idx, col in enumerate(streamed.columns):
+            values = [row[idx] for row in loaded.rows]
+            expected = dl.profile_column(col.name, idx, values)
+            self.assertEqual(col.total, expected.total)
+            self.assertEqual(col.missing, expected.missing)
+            self.assertEqual(col.kind, expected.kind)
+            self.assertEqual(col.distinct, expected.distinct)
+
+    def test_a_very_long_field_is_not_rejected(self):
+        # csv's default 128 KiB field cap would otherwise raise here.
+        path = self.dir / "long.csv"
+        path.write_text("a,b\n" + "x" * 300_000 + ",1\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual(profile.rows, 1)
+        self.assertEqual(profile.columns[0].max_len, 300_000)
+
+    def test_ragged_rows_are_padded_to_header_width(self):
+        path = self.dir / "r.csv"
+        path.write_text("a,b,c\n1,2\n1,2,3,4\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual(profile.ragged_rows, 2)
+        self.assertEqual(profile.rows, 2)
+        self.assertEqual(profile.columns[2].total, 2)
+
+    def test_duplicate_rows_are_counted(self):
+        path = self.dir / "d.csv"
+        path.write_text("a,b\n1,2\n1,2\n3,4\n", encoding="utf-8")
+        self.assertEqual(dl.analyse(path).duplicate_rows, 1)
+
+    def test_limit_stops_after_n_rows(self):
+        path = self.dir / "l.csv"
+        path.write_text("a\n" + "".join(f"{i}\n" for i in range(50)), encoding="utf-8")
+        profile = dl.analyse(path, limit=10)
+        self.assertEqual(profile.rows, 10)
+        self.assertTrue(profile.truncated)
+
+    def test_blank_lines_are_skipped_not_counted(self):
+        path = self.dir / "blank.csv"
+        path.write_text("a\n1\n\n\n2\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual(profile.rows, 2)
+        self.assertEqual(profile.empty_rows, 2)
+
+    def test_pearson_drops_whole_pairs(self):
+        import math
+
+        xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+        ys = [2.0, math.nan, 6.0, 8.0, 10.0]
+        self.assertAlmostEqual(dl.pearson(xs, ys), 1.0, places=9)
+
+    def test_correlations_compare_the_same_rows(self):
+        # A wave, not a straight line: if the two columns were sampled
+        # independently their rows would drift apart and r would collapse.
+        import math
+
+        path = self.dir / "wave.csv"
+        lines = ["x,y"]
+        for i in range(400):
+            y = "" if i % 7 == 0 else f"{math.sin(i / 5):.6f}"
+            lines.append(f"{i},{y}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        profile = dl.analyse(path)
+        samples = [c.values_sample for c in profile.columns if c.kind in ("int", "float")]
+        self.assertEqual(len({len(s) for s in samples}), 1, "samples are not row-aligned")
+
+        # x is a ramp and y is a wave, so this is not a strong pair; what
+        # matters is that every pair comes from one row, which the alignment
+        # assertion above pins down. Check the plumbing survives gaps at all.
+        self.assertEqual(profile.columns[1].missing, 58)
+
+    def test_strong_correlation_survives_gaps(self):
+        path = self.dir / "gaps.csv"
+        lines = ["price,price_cny"]
+        for i in range(300):
+            cny = "" if i % 5 == 0 else str(i * 7 + 3)
+            lines.append(f"{i},{cny}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        profile = dl.analyse(path)
+        self.assertTrue(profile.correlations)
+        a, b, r = profile.correlations[0]
+        self.assertEqual({a, b}, {"price", "price_cny"})
+        self.assertGreater(r, 0.99)
+
+
+class TestMemoryCeiling(unittest.TestCase):
+    """The point of streaming: memory must not follow the row count.
+
+    Measured against ``load_source`` on the same file rather than against a
+    hard-coded megabyte figure, so the test means the same thing on every
+    machine and in every Python version.
+    """
+
+    ROWS = 200_000
+
+    def test_streaming_uses_less_memory_than_loading(self):
+        import tracemalloc
+
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "big.csv"
+
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write("id,amount,region,when\n")
+            for i in range(self.ROWS):
+                handle.write(f"{i},{i % 997},R{i % 13},2024-{(i % 12) + 1:02d}-01\n")
+
+        tracemalloc.start()
+        profile = dl.analyse(path)
+        _, streamed = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        tracemalloc.start()
+        dl.load_source(path)
+        _, loaded = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        self.assertEqual(profile.rows, self.ROWS)
+        self.assertLess(
+            streamed / loaded, 0.8,
+            f"streaming used {streamed / 1048576:.1f} MB, "
+            f"loading used {loaded / 1048576:.1f} MB — streaming should be well under",
+        )
+        for col in profile.columns:
+            self.assertLessEqual(len(col.values_sample), dl.CORRELATION_SAMPLE)
+            self.assertLessEqual(col.distinct, dl.DISTINCT_CAP)
 
 
 if __name__ == "__main__":

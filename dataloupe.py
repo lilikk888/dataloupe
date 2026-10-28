@@ -16,23 +16,24 @@ from __future__ import annotations
 import argparse
 import codecs
 import csv
-import io
 import json
 import math
 import os
+import random
 import re
-import statistics
 import sys
 import time
 import unicodedata
 import zipfile
+from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Iterator
 from xml.etree import ElementTree as ET
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -75,6 +76,17 @@ CORRELATION_REPORT_THRESHOLD = 0.5
 
 #: |r| above this means the two columns carry essentially the same information.
 CORRELATION_REDUNDANT_THRESHOLD = 0.98
+
+#: Upper bound on distinct values tracked per column. Past this the count is
+#: reported as "at least N" rather than scanning a 10-million-key set.
+DISTINCT_CAP = 100_000
+
+#: Upper bound on rows remembered when hunting for duplicate rows.
+DEDUP_CAP = 200_000
+
+#: Column samples are drawn with a fixed seed so two runs on the same file
+#: always print the same numbers.
+RESERVOIR_SEED = 0x0DA7A10
 
 INT_RE = re.compile(r"^[+-]?\d{1,20}$")
 FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?$")
@@ -225,13 +237,17 @@ def _decodes(raw: bytes, encoding: str) -> bool:
 
 
 def detect_encoding(path: Path) -> str:
-    """Guess a text encoding by BOM first, then by trial decoding.
+    """Guess the encoding of *path* from its first 256 KiB."""
+    with path.open("rb") as fh:
+        return detect_encoding_bytes(fh.read(256 * 1024))
+
+
+def detect_encoding_bytes(raw: bytes) -> str:
+    """Guess an encoding by BOM first, then by trial decoding.
 
     Order matters: UTF-8 is strict, GB18030 accepts almost any byte sequence,
     so it must come after UTF-8 but before the legacy single-byte fallbacks.
     """
-    with path.open("rb") as fh:
-        raw = fh.read(256 * 1024)
     if not raw:
         return "utf-8"
     if raw.startswith(codecs.BOM_UTF8):
@@ -242,6 +258,14 @@ def detect_encoding(path: Path) -> str:
         if _decodes(raw, encoding):
             return encoding
     return "latin-1"
+
+
+def peek_text(path: Path, size: int = 256 * 1024) -> tuple[str, str]:
+    """Return ``(encoding, decoded_prefix)`` without reading the whole file."""
+    with path.open("rb") as fh:
+        raw = fh.read(size)
+    encoding = detect_encoding_bytes(raw)
+    return encoding, raw.decode(encoding, errors="replace")
 
 
 def sniff_delimiter(sample: str) -> str:
@@ -486,8 +510,109 @@ class Source:
     empty_rows: int = 0
 
 
-def load_source(path: Path, limit: int | None = None) -> Source:
-    """Read any supported file into a uniform header + rows structure."""
+@dataclass
+class StreamStats:
+    """Counters the row iterator fills in as it runs.
+
+    The iterator is lazy, so these cannot be return values — they are read back
+    after the caller has drained it.
+    """
+    read: int = 0
+    ragged: int = 0
+    empty: int = 0
+
+
+@dataclass
+class SourceStream:
+    """Everything known about a file before its rows have been read."""
+    header: list[str]
+    fmt: str
+    encoding: str
+    delimiter: str
+    size: int
+    stats: StreamStats
+
+
+def _raise_csv_field_limit() -> None:
+    """Lift the 128 KiB per-field cap.
+
+    ``csv`` refuses fields longer than 131072 characters by default, which is
+    easy to hit with a CSV carrying JSON blobs or long descriptions. The cap
+    exists to stop runaway memory use on malformed input, not because the
+    parser cannot handle it.
+    """
+    limit = sys.maxsize
+    while limit > 1 << 16:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            # 32-bit builds store the limit in a C long.
+            limit //= 1024
+
+
+def _csv_rows(
+    path: Path,
+    encoding: str,
+    delimiter: str,
+    limit: int | None,
+    stats: StreamStats,
+) -> tuple[list[str], Iterator[list[str]]]:
+    """Open a delimited file and hand back its header plus a lazy row iterator.
+
+    The file stays open for the lifetime of the iterator and is closed when it
+    is exhausted or abandoned, so callers never hold the whole file in memory.
+    """
+    _raise_csv_field_limit()
+    handle = path.open("r", encoding=encoding, errors="replace", newline="")
+    try:
+        reader = csv.reader(handle, delimiter=delimiter)
+        header: list[str] | None = None
+        for row in reader:
+            if not row or all(not cell.strip() for cell in row):
+                stats.empty += 1
+                continue
+            header = row
+            break
+        if header is None:
+            raise ValueError("文件是空的，或者没有可解析的数据 / file is empty")
+    except Exception:
+        handle.close()
+        raise
+
+    width = len(header)
+
+    def generate() -> Iterator[list[str]]:
+        try:
+            for row in reader:
+                if limit is not None and stats.read >= limit:
+                    return
+                if not row or all(not cell.strip() for cell in row):
+                    stats.empty += 1
+                    continue
+                if len(row) != width:
+                    stats.ragged += 1
+                    if len(row) < width:
+                        row = row + [""] * (width - len(row))
+                    else:
+                        row = row[:width]
+                stats.read += 1
+                yield row
+        finally:
+            handle.close()
+
+    return header, generate()
+
+
+def iter_source(
+    path: Path, limit: int | None = None
+) -> tuple[SourceStream, Iterator[list[str]]]:
+    """Detect what *path* is, then stream its rows.
+
+    CSV / TSV are read incrementally — only one row is in memory at a time.
+    XLSX, JSON and JSONL are parsed whole, because those formats have no
+    meaningful line boundary to stream on and are rarely large.
+    """
     if not path.exists():
         raise FileNotFoundError(f"文件不存在 / file not found: {path}")
     if path.is_dir():
@@ -495,19 +620,22 @@ def load_source(path: Path, limit: int | None = None) -> Source:
 
     size = path.stat().st_size
     suffix = path.suffix.lower()
+    stats = StreamStats()
 
     if suffix in (".xlsx", ".xlsm"):
         header, rows = read_xlsx(path, limit)
-        return Source(path, header, rows, "xlsx", "—", "—", size)
+        stats.read = len(rows)
+        return SourceStream(header, "xlsx", "—", "—", size, stats), iter(rows)
 
-    encoding = detect_encoding(path)
-    text = path.read_text(encoding=encoding, errors="replace")
+    encoding, sample = peek_text(path)
+    stripped = sample.lstrip()
 
-    stripped = text.lstrip()
-    if suffix in (".json",) or (stripped[:1] in "[{" and suffix not in (".csv", ".tsv")):
+    if suffix == ".json" or (stripped[:1] in "[{" and suffix not in (".csv", ".tsv")):
         try:
+            text = path.read_text(encoding=encoding, errors="replace")
             header, rows = _read_json_array(text, limit)
-            return Source(path, header, rows, "json", encoding, "—", size)
+            stats.read = len(rows)
+            return SourceStream(header, "json", encoding, "—", size, stats), iter(rows)
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -517,47 +645,33 @@ def load_source(path: Path, limit: int | None = None) -> Source:
         len(probe) >= 2 and all(ln.lstrip().startswith("{") for ln in probe)
         and all(_is_json_object(ln) for ln in probe)
     ):
+        text = path.read_text(encoding=encoding, errors="replace")
         header, rows = _read_jsonl(text, limit)
         if header:
-            return Source(path, header, rows, "jsonl", encoding, "—", size)
+            stats.read = len(rows)
+            return SourceStream(header, "jsonl", encoding, "—", size, stats), iter(rows)
 
-    delimiter = "\t" if suffix == ".tsv" else sniff_delimiter(text[:65536])
+    delimiter = "\t" if suffix == ".tsv" else sniff_delimiter(sample)
     fmt = "tsv" if delimiter == "\t" else "csv"
+    header, rows = _csv_rows(path, encoding, delimiter, limit, stats)
+    return SourceStream(header, fmt, encoding, delimiter, size, stats), rows
 
-    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
-    raw_rows: list[list[str]] = []
-    empty = 0
-    try:
-        for row in reader:
-            # +1 because the header occupies the first row.
-            if limit is not None and len(raw_rows) >= limit + 1:
-                break
-            if not row or all(not cell.strip() for cell in row):
-                empty += 1
-                continue
-            raw_rows.append(row)
-    except csv.Error as exc:
-        raise ValueError(f"CSV 解析失败 / cannot parse CSV: {exc}") from exc
 
-    if not raw_rows:
-        raise ValueError("文件是空的，或者没有可解析的数据 / file is empty")
-
-    header = raw_rows[0]
-    body = raw_rows[1:]
-
-    width = len(header)
-    ragged = 0
-    normalised: list[list[str]] = []
-    for row in body:
-        if len(row) != width:
-            ragged += 1
-            if len(row) < width:
-                row = row + [""] * (width - len(row))
-            else:
-                row = row[:width]
-        normalised.append(row)
-
-    return Source(path, header, normalised, fmt, encoding, delimiter, size, ragged, empty)
+def load_source(path: Path, limit: int | None = None) -> Source:
+    """Read any supported file fully into memory. Used by ``--fix``, which has
+    to rewrite the whole table anyway."""
+    stream, rows = iter_source(path, limit)
+    return Source(
+        path=path,
+        header=stream.header,
+        rows=list(rows),
+        fmt=stream.fmt,
+        encoding=stream.encoding,
+        delimiter=stream.delimiter,
+        size=stream.size,
+        ragged_rows=stream.stats.ragged,
+        empty_rows=stream.stats.empty,
+    )
 
 
 def _is_json_object(line: str) -> bool:
@@ -585,10 +699,13 @@ def parse_date(value: str) -> datetime | None:
 
     match = ISO_LIKE_RE.match(text)
     if match:
+        # One groups() call rather than six group(n) calls: this runs once per
+        # cell of every date column, so the difference is measurable.
+        year, month, day, hour, minute, second = match.groups()
         try:
             return datetime(
-                int(match.group(1)), int(match.group(2)), int(match.group(3)),
-                int(match.group(4) or 0), int(match.group(5) or 0), int(match.group(6) or 0),
+                int(year), int(month), int(day),
+                int(hour or 0), int(minute or 0), int(second or 0),
             )
         except ValueError:
             return None
@@ -690,7 +807,19 @@ def infer_kind(values: list[str]) -> tuple[str, int]:
     for value in sample:
         counts[classify_value(value)] += 1
 
-    total = len(sample)
+    return kind_from_counts(counts)
+
+
+def kind_from_counts(counts: dict[str, int]) -> tuple[str, int]:
+    """Decide a column's type from already-tallied per-value classifications.
+
+    Split out from :func:`infer_kind` so the streaming accumulator can tally
+    while it reads, and only commit to a type once it has seen enough values.
+    """
+    total = sum(counts.values())
+    if not total:
+        return "empty", 0
+
     numeric = counts["int"] + counts["float"]
     if numeric / total >= TYPE_TOLERANCE:
         kind = "int" if counts["float"] == 0 else "float"
@@ -730,7 +859,11 @@ class ColumnProfile:
     total: int = 0
     missing: int = 0
     distinct: int = 0
+    distinct_capped: bool = False
     mismatch: int = 0
+    #: True when quantiles / histogram were estimated from a sample, not the
+    #: whole column (only happens above MAX_VALUES values).
+    approximate: bool = False
     # numeric
     num_min: float | None = None
     num_max: float | None = None
@@ -790,6 +923,9 @@ class Profile:
     elapsed: float
     correlations: list[tuple[str, str, float]] = field(default_factory=list)
     truncated: bool = False
+    #: True when the file had more distinct rows than DEDUP_CAP, so the
+    #: duplicate count only covers the rows remembered.
+    duplicate_scan_capped: bool = False
 
     def issues_by(self, severity: str) -> list[Issue]:
         return [i for i in self.issues if i.severity == severity]
@@ -828,90 +964,319 @@ def histogram(values: list[float], buckets: int = HIST_BUCKETS) -> tuple[list[in
     return counts, edges
 
 
-def profile_column(name: str, index: int, values: list[str]) -> ColumnProfile:
-    """Compute every statistic for one column."""
-    col = ColumnProfile(name=name, index=index, total=len(values))
+def _to_number(value: str) -> float | None:
+    """Parse a cell as a number, tolerating thousands separators."""
+    text = value.strip()
+    try:
+        return float(text)
+    except ValueError:
+        # Thousands separators are the only common fix-up worth trying.
+        if "," not in text:
+            return None
+        try:
+            return float(text.replace(",", ""))
+        except ValueError:
+            return None
 
-    non_empty = [v for v in values if not is_missing(v)]
-    col.missing = len(values) - len(non_empty)
-    col.kind, col.mismatch = infer_kind(non_empty)
 
-    col.distinct = len(set(map(str.strip, non_empty)))
+class ColumnAccumulator:
+    """Streaming statistics for one column.
 
-    # One pass over a sample, not four passes over everything.
-    for value in non_empty[:HYGIENE_SAMPLE]:
+    Feed values in with :meth:`add`, read the result out with :meth:`finish`.
+    Memory stays bounded no matter how many rows pass through, because every
+    structure it keeps has a hard cap: the distinct-value table stops growing at
+    DISTINCT_CAP, the numeric sample at MAX_VALUES, the type tally at
+    TYPE_SAMPLE, the hygiene tally at HYGIENE_SAMPLE.
+
+    Two-phase by necessity. A column's type cannot be known until enough values
+    have been classified, yet the type decides which statistics are worth
+    collecting — hoarding every numeric value of a text column is pure waste.
+    So the first TYPE_SAMPLE non-empty values are buffered, a type is chosen,
+    and the buffer is replayed into the right collector. Everything after that
+    flows straight through.
+
+    One consequence worth knowing: past MAX_VALUES numeric values, the median,
+    quartiles and histogram come from a uniform random sample (reservoir
+    sampling, Algorithm L) instead of the whole column, and the profile is
+    flagged ``approximate``. Min, max, mean, standard deviation and the missing
+    count stay exact at any size.
+    """
+
+    __slots__ = (
+        "name", "index", "kind", "total", "missing", "mismatch",
+        "_counts", "_head", "_typed", "_values", "_distinct_capped",
+        "_distinct_count", "_sink",
+        "_min_len", "_max_len",
+        "_num_min", "_num_max", "_n", "_mean", "_m2",
+        "_sample", "_seen", "_rng", "_w", "_next",
+        "_date_min", "_date_max", "_formats", "_ambiguous", "_dated",
+        "_hygiene_seen", "_leading", "_trailing", "_fullwidth", "_control",
+    )
+
+    def __init__(self, name: str, index: int) -> None:
+        self.name = name
+        self.index = index
+        self.kind: str | None = None
+        self.total = 0
+        self.missing = 0
+        self.mismatch = 0
+
+        self._counts = {"bool": 0, "int": 0, "float": 0, "date": 0, "text": 0}
+        self._head: list[str] = []
+        self._typed = 0
+        self._values: dict[str, int] = {}
+        self._distinct_capped = False
+        self._distinct_count = 0
+        #: Bound method that absorbs one stripped cell, once the type is known.
+        self._sink = None
+
+        self._min_len = -1
+        self._max_len = -1
+
+        self._num_min = math.inf
+        self._num_max = -math.inf
+        self._n = 0
+        self._mean = 0.0
+        self._m2 = 0.0
+        self._sample = array("d")
+        self._seen = 0
+        self._rng = random.Random(RESERVOIR_SEED + index)
+        self._w = 1.0
+        self._next = 1
+
+        self._date_min: datetime | None = None
+        self._date_max: datetime | None = None
+        self._formats: Counter[str] = Counter()
+        self._ambiguous = 0
+        self._dated = 0
+
+        self._hygiene_seen = 0
+        self._leading = 0
+        self._trailing = 0
+        self._fullwidth = 0
+        self._control = 0
+
+    # -- ingest ------------------------------------------------------------
+
+    def add(self, value: str) -> None:
+        """Fold one cell into the running statistics."""
+        self.total += 1
+        # Strip once here and pass the clean text down: every downstream step
+        # wants it stripped anyway, and this is the hottest path in the program.
+        text = value.strip()
+        if not text:
+            self.missing += 1
+            return
+        if len(text) <= 8 and text.lower() in MISSING_TOKENS:
+            self.missing += 1
+            return
+
+        # Once the distinct table is full there is nothing left to learn from
+        # it, and high-cardinality columns are exactly the ones with millions
+        # of rows to get through — so stop paying for the lookup and hand the
+        # memory back. Only the count is kept.
+        values = self._values
+        if self._distinct_capped:
+            pass
+        elif text in values:
+            values[text] += 1
+        elif len(values) < DISTINCT_CAP:
+            values[text] = 1
+            self._distinct_count = len(values)
+        else:
+            self._distinct_capped = True
+            self._distinct_count = len(values)
+            values.clear()
+
+        if self._hygiene_seen < HYGIENE_SAMPLE:
+            self._hygiene_seen += 1
+            self._check_hygiene(value)
+
+        if self.kind is None:
+            self._head.append(text)
+            self._typed += 1
+            self._counts[classify_value(text)] += 1
+            if self._typed >= TYPE_SAMPLE:
+                self._decide()
+        else:
+            self._sink(text)
+
+    def _decide(self) -> None:
+        """Commit to a column type, then replay the buffered prefix."""
+        self.kind, self.mismatch = kind_from_counts(self._counts)
+        self._sink = getattr(self, _SINKS[self.kind])
+        head, self._head = self._head, []
+        for text in head:
+            self._sink(text)
+
+    def _absorb_number(self, text: str) -> None:
+        """Parse a numeric cell, then fold it into Welford and the reservoir."""
+        try:
+            x = float(text)
+        except ValueError:
+            # Thousands separators are the only common fix-up worth trying.
+            if "," not in text:
+                return
+            try:
+                x = float(text.replace(",", ""))
+            except ValueError:
+                return
+
+        if x < self._num_min:
+            self._num_min = x
+        if x > self._num_max:
+            self._num_max = x
+
+        n = self._n + 1
+        self._n = n
+        delta = x - self._mean
+        self._mean += delta / n
+        self._m2 += delta * (x - self._mean)
+
+        seen = self._seen + 1
+        self._seen = seen
+        if seen <= MAX_VALUES:
+            self._sample.append(x)
+            if seen == MAX_VALUES:
+                self._seed_reservoir()
+        elif seen >= self._next:
+            self._replace_reservoir(x)
+
+    def _absorb_date(self, text: str) -> None:
+        stamp = parse_date(text)
+        if stamp is not None:
+            if self._date_min is None or stamp < self._date_min:
+                self._date_min = stamp
+            if self._date_max is None or stamp > self._date_max:
+                self._date_max = stamp
+        if self._dated < TYPE_SAMPLE:
+            self._dated += 1
+            shape = detect_date_format(text)
+            if shape is not None:
+                self._formats[shape] += 1
+            if is_ambiguous_date(text):
+                self._ambiguous += 1
+
+    def _absorb_text(self, text: str) -> None:
+        length = len(text)
+        if self._min_len < 0 or length < self._min_len:
+            self._min_len = length
+        if length > self._max_len:
+            self._max_len = length
+
+    def _check_hygiene(self, value: str) -> None:
         if value[:1].isspace():
-            col.leading_space += 1
+            self._leading += 1
         if value[-1:].isspace():
-            col.trailing_space += 1
+            self._trailing += 1
         has_fw = has_ctrl = False
         for ch in value:
             cp = ord(ch)
-            if not has_fw and (0xFF01 <= cp <= 0xFF60 or cp == 0x3000 or 0xFFE0 <= cp <= 0xFFE6):
+            if not has_fw and (0xFF01 <= cp <= 0xFF60 or cp == 0x3000 or cp == 0xFFE0 <= cp <= 0xFFE6):
                 has_fw = True
             elif not has_ctrl and cp < 32 and ch != "\t":
                 has_ctrl = True
             if has_fw and has_ctrl:
                 break
         if has_fw:
-            col.fullwidth += 1
+            self._fullwidth += 1
         if has_ctrl:
-            col.control_chars += 1
+            self._control += 1
 
-    if col.kind in ("int", "float"):
-        numbers: list[float] = []
-        for value in non_empty:
-            text = value.strip()
-            try:
-                numbers.append(float(text))
-            except ValueError:
-                # Thousands separators are the only common fix-up worth trying.
-                if "," in text:
-                    try:
-                        numbers.append(float(text.replace(",", "")))
-                    except ValueError:
-                        continue
-        numbers = numbers[:MAX_VALUES]
-        if numbers:
-            col.num_min = min(numbers)
-            col.num_max = max(numbers)
-            col.num_mean = statistics.fmean(numbers)
-            col.num_std = statistics.pstdev(numbers) if len(numbers) > 1 else 0.0
-            ordered = sorted(numbers)
-            col.num_median = percentile(ordered, 0.5)
-            col.num_q1 = percentile(ordered, 0.25)
-            col.num_q3 = percentile(ordered, 0.75)
-            if col.num_q1 is not None and col.num_q3 is not None:
-                iqr = col.num_q3 - col.num_q1
-                low_fence = col.num_q1 - 1.5 * iqr
-                high_fence = col.num_q3 + 1.5 * iqr
-                col.num_outliers = sum(1 for n in numbers if n < low_fence or n > high_fence)
-            col.histogram, col.hist_edges = histogram(numbers)
-            # Keep a bounded sample for pairwise correlation.
-            col.values_sample = numbers[:CORRELATION_SAMPLE]
+    # -- reservoir (Algorithm L) -------------------------------------------
 
-    elif col.kind == "date":
-        stamps = [d for d in (parse_date(v) for v in non_empty) if d is not None]
-        if stamps:
-            col.date_min = min(stamps).strftime("%Y-%m-%d")
-            col.date_max = max(stamps).strftime("%Y-%m-%d")
-        shapes = Counter(detect_date_format(v) for v in non_empty[:TYPE_SAMPLE])
-        shapes.pop(None, None)
-        col.date_formats = [name for name, _ in shapes.most_common()]
-        col.ambiguous_dates = sum(1 for v in non_empty[:TYPE_SAMPLE] if is_ambiguous_date(v))
+    def _seed_reservoir(self) -> None:
+        self._w = max(math.exp(math.log(self._rng.random() or 1e-12) / MAX_VALUES), 1e-12)
+        self._next = self._seen + self._skip()
 
-    else:
-        lengths = [len(v.strip()) for v in non_empty]
-        if lengths:
-            col.min_len = min(lengths)
-            col.max_len = max(lengths)
-        counter: dict[str, int] = {}
-        for value in non_empty:
-            key = value.strip()
-            counter[key] = counter.get(key, 0) + 1
-        col.top_values = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    def _replace_reservoir(self, x: float) -> None:
+        """Swap one sampled slot, then skip ahead geometrically.
 
-    return col
+        Plain reservoir sampling calls the RNG once per row, which on ten
+        million rows costs seconds. Algorithm L skips ahead instead, so the RNG
+        is touched only a few hundred thousand times.
+        """
+        self._sample[self._rng.randrange(MAX_VALUES)] = x
+        self._w = max(self._w * math.exp(math.log(self._rng.random() or 1e-12) / MAX_VALUES), 1e-12)
+        self._next = self._seen + self._skip()
+    def _skip(self) -> int:
+        return _skip_ahead(self._rng, self._w)
+
+    # -- output ------------------------------------------------------------
+
+    def finish(self) -> ColumnProfile:
+        """Freeze the running statistics into a ColumnProfile."""
+        if self.kind is None:
+            self._decide()
+
+        col = ColumnProfile(name=self.name, index=self.index, total=self.total)
+        col.kind = self.kind or "empty"
+        col.missing = self.missing
+        col.mismatch = self.mismatch
+        col.distinct = self._distinct_count
+        col.distinct_capped = self._distinct_capped
+        col.leading_space = self._leading
+        col.trailing_space = self._trailing
+        col.fullwidth = self._fullwidth
+        col.control_chars = self._control
+
+        if col.kind in ("int", "float"):
+            if self._n:
+                col.num_min = self._num_min
+                col.num_max = self._num_max
+                col.num_mean = self._mean
+                col.num_std = math.sqrt(self._m2 / self._n) if self._n > 1 else 0.0
+                col.approximate = self._n > MAX_VALUES
+                ordered = sorted(self._sample)
+                col.num_median = percentile(ordered, 0.5)
+                col.num_q1 = percentile(ordered, 0.25)
+                col.num_q3 = percentile(ordered, 0.75)
+                if col.num_q1 is not None and col.num_q3 is not None:
+                    iqr = col.num_q3 - col.num_q1
+                    low_fence = col.num_q1 - 1.5 * iqr
+                    high_fence = col.num_q3 + 1.5 * iqr
+                    col.num_outliers = sum(1 for n in self._sample if n < low_fence or n > high_fence)
+                col.histogram, col.hist_edges = histogram(self._sample)
+                # A uniform sample's prefix is still uniform, so correlation can
+                # read straight off it.
+                col.values_sample = list(self._sample[:CORRELATION_SAMPLE])
+
+        elif col.kind == "date":
+            if self._date_min is not None:
+                col.date_min = self._date_min.strftime("%Y-%m-%d")
+            if self._date_max is not None:
+                col.date_max = self._date_max.strftime("%Y-%m-%d")
+            col.date_formats = [name for name, _ in self._formats.most_common()]
+            col.ambiguous_dates = self._ambiguous
+
+        else:
+            col.min_len = max(self._min_len, 0)
+            col.max_len = max(self._max_len, 0)
+            col.top_values = sorted(self._values.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+
+        return col
+
+
+def profile_column(name: str, index: int, values: list[str]) -> ColumnProfile:
+    """Compute every statistic for one already-loaded column."""
+    acc = ColumnAccumulator(name, index)
+    for value in values:
+        acc.add(value)
+    return acc.finish()
+
+
+#: Which per-type absorber a column feeds into once its type is settled.
+#: Resolved by name so the binding happens per column, not per cell.
+_SINKS = {
+    "int": "_absorb_number",
+    "float": "_absorb_number",
+    "date": "_absorb_date",
+    "bool": "_absorb_text",
+    "text": "_absorb_text",
+    # An empty column has no non-empty values, so this is never called; the
+    # entry exists so _SINKS covers every kind kind_from_counts can return.
+    "empty": "_absorb_text",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -921,16 +1286,21 @@ def profile_column(name: str, index: int, values: list[str]) -> ColumnProfile:
 def pearson(xs: list[float], ys: list[float]) -> float | None:
     """Pearson correlation coefficient, or None when it is undefined.
 
+    NaN marks a cell that was missing in one of the two columns. Those rows are
+    dropped as pairs, never one side at a time — otherwise the two series slide
+    out of alignment and the coefficient describes rows that never existed.
+
     Undefined means: fewer than 3 paired values, or either series is constant
     (zero variance), where the formula divides by zero.
     """
-    n = min(len(xs), len(ys))
+    pairs = [(x, y) for x, y in zip(xs, ys) if x == x and y == y]
+    n = len(pairs)
     if n < 3:
         return None
-    mean_x = sum(xs[:n]) / n
-    mean_y = sum(ys[:n]) / n
+    mean_x = sum(x for x, _ in pairs) / n
+    mean_y = sum(y for _, y in pairs) / n
     numerator = var_x = var_y = 0.0
-    for x, y in zip(xs[:n], ys[:n]):
+    for x, y in pairs:
         dx = x - mean_x
         dy = y - mean_y
         numerator += dx * dy
@@ -986,6 +1356,13 @@ def find_issues(profile: Profile) -> list[Issue]:
     if profile.empty_rows:
         issues.append(Issue(
             "low", "存在空行", f"{profile.empty_rows} 行完全为空（已跳过）",
+        ))
+
+    if profile.duplicate_scan_capped:
+        issues.append(Issue(
+            "low", "重复行检测未覆盖全表",
+            f"文件超过 {DEDUP_CAP:,} 个不同行，去重只核对了前 {DEDUP_CAP:,} 个",
+            suggestion="数据量到这个规模，建议在数据库里用 GROUP BY 判断重复",
         ))
 
     for col in profile.columns:
@@ -1066,12 +1443,18 @@ def find_issues(profile: Profile) -> list[Issue]:
             issues.append(Issue("low", "常量列", f"「{label}」所有值都一样", column=col.name,
                                 suggestion="对分析没有信息量，可考虑移除"))
 
-        if col.kind == "text" and col.total >= 20 and col.distinct_rate >= 0.98:
+        # A capped distinct count means "at least DISTINCT_CAP", which is
+        # itself proof of high cardinality — the rate is meaningless once the
+        # table stops growing, so treat the cap as a match.
+        if col.kind == "text" and col.total >= 20 and (col.distinct_capped or col.distinct_rate >= 0.98):
+            shown = f"≥{col.distinct:,}" if col.distinct_capped else f"{col.distinct:,}"
             issues.append(Issue("low", "疑似 ID 列",
-                                f"「{label}」几乎每行都不同（{col.distinct}/{col.total}）",
+                                f"「{label}」几乎每行都不同（{shown}/{col.total:,}）",
                                 column=col.name, suggestion="大概率是主键或唯一标识，不适合做统计"))
 
-        elif col.kind == "int" and col.total >= 20 and col.missing == 0 and col.distinct_rate >= 0.99:
+        elif col.kind == "int" and col.total >= 20 and col.missing == 0 and (
+            col.distinct_capped or col.distinct_rate >= 0.99
+        ):
             span = (col.num_max or 0) - (col.num_min or 0)
             if span >= col.total - 1:
                 issues.append(Issue("low", "疑似序号列",
@@ -1136,59 +1519,160 @@ def score_quality(issues: list[Issue]) -> int:
 # Top-level analysis
 # ---------------------------------------------------------------------------
 
-def analyse(path: Path, limit: int | None = None) -> Profile:
-    """Read *path* and build a complete Profile."""
-    started = time.perf_counter()
-    source = load_source(path, limit)
+def _skip_ahead(rng: random.Random, w: float) -> int:
+    """How many items Algorithm L may pass over before taking the next one."""
+    if not 0.0 < w < 1.0:
+        return 0
+    return int(math.log(rng.random() or 1e-12) / math.log1p(-w))
 
-    if not source.header:
+
+def _row_fingerprint(row: list[str]) -> int:
+    """A 64-bit fingerprint of a whole row.
+
+    Rows are compared by fingerprint rather than by value so duplicate
+    detection never holds a copy of the file in memory. ``hash(tuple(row))``
+    is used rather than a hand-rolled loop because the built-in runs entirely
+    in C — it is roughly nine times faster, which matters at ten million rows.
+
+    Two different rows colliding in 64 bits is a 1-in-1.8e19 event. Even across
+    a billion rows the odds are about one in eighteen billion.
+    """
+    return hash(tuple(row))
+
+
+def _attach_row_aligned_samples(
+    columns: list[ColumnProfile], rows: list[tuple[str, ...]]
+) -> None:
+    """Replace each numeric column's sample with a row-aligned float series.
+
+    A gap in one column used to shift that column's sample against its
+    neighbour's, so the two series described different rows. Missing cells
+    become NaN instead, and :func:`pearson` drops whole pairs.
+    """
+    numeric = [i for i, col in enumerate(columns) if col.kind in ("int", "float")]
+    if not numeric or not rows:
+        return
+
+    series: dict[int, list[float]] = {i: [] for i in numeric}
+    for row in rows:
+        for i in numeric:
+            cell = row[i] if i < len(row) else ""
+            number = _to_number(cell) if cell else None
+            series[i].append(math.nan if number is None else number)
+    for i in numeric:
+        columns[i].values_sample = series[i]
+
+
+def analyse(path: Path, limit: int | None = None) -> Profile:
+    """Stream *path* and build a complete Profile.
+
+    Memory is bounded by the column count, not the row count: rows are folded
+    into per-column accumulators as they arrive and then discarded. A 10-million
+    row file costs the same as a 10-row one, apart from time.
+    """
+    started = time.perf_counter()
+    stream, rows = iter_source(path, limit)
+
+    if not stream.header:
         raise ValueError("没有识别到表头 / no header row found")
 
     # Disambiguate duplicate / empty column names so dict keys stay unique.
     names: list[str] = []
     counts: dict[str, int] = {}
-    for idx, raw_name in enumerate(source.header):
+    for idx, raw_name in enumerate(stream.header):
         name = raw_name.strip() or f"列{idx + 1}"
         counts[name] = counts.get(name, 0) + 1
         names.append(name if counts[name] == 1 else f"{name}_{counts[name]}")
 
+    accumulators = [ColumnAccumulator(name, idx) for idx, name in enumerate(names)]
+    width = len(accumulators)
+
+    seen: set[int] = set()
+    duplicates = 0
+    dedup_capped = False
+    preview: list[list[str]] = []
+    row_count = 0
+
+    # Correlations need the same rows on both sides of every pair. Sampling each
+    # column separately would pair row 8 of one column with row 12 of another,
+    # so the sample is drawn once per row and split into columns afterwards.
+    # The cell budget keeps a 200-column sheet from costing 200x the memory.
+    corr_cap = max(50, min(CORRELATION_SAMPLE, 400_000 // max(width, 1)))
+    corr_rows: list[tuple[str, ...]] = []
+    corr_seen = 0
+    corr_rng = random.Random(RESERVOIR_SEED)
+    corr_w = 1.0
+    corr_next = 1
+
+    try:
+        for row in rows:
+            row_count += 1
+            if len(preview) < PREVIEW_ROWS:
+                preview.append(row)
+
+            fingerprint = _row_fingerprint(row)
+            if fingerprint in seen:
+                duplicates += 1
+            elif not dedup_capped:
+                if len(seen) < DEDUP_CAP:
+                    seen.add(fingerprint)
+                else:
+                    dedup_capped = True
+
+            corr_seen += 1
+            if corr_seen <= corr_cap:
+                corr_rows.append(tuple(row))
+                if corr_seen == corr_cap:
+                    corr_w = max(math.exp(math.log(corr_rng.random() or 1e-12) / corr_cap), 1e-12)
+                    corr_next = corr_seen + _skip_ahead(corr_rng, corr_w)
+            elif corr_seen >= corr_next:
+                corr_rows[corr_rng.randrange(corr_cap)] = tuple(row)
+                corr_w = max(corr_w * math.exp(math.log(corr_rng.random() or 1e-12) / corr_cap), 1e-12)
+                corr_next = corr_seen + _skip_ahead(corr_rng, corr_w)
+
+            if len(row) == width:
+                for acc, cell in zip(accumulators, row):
+                    acc.add(cell)
+            else:
+                for idx, acc in enumerate(accumulators):
+                    acc.add(row[idx] if idx < len(row) else "")
+    finally:
+        # Release the file handle even if a column accumulator raised. Plain
+        # list iterators (xlsx, JSON) have nothing to close.
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
+
+    header_counts = Counter(raw.strip() for raw in stream.header)
     columns: list[ColumnProfile] = []
-    for idx, name in enumerate(names):
-        values = [row[idx] if idx < len(row) else "" for row in source.rows]
-        col = profile_column(name, idx, values)
-        col.empty_name = not source.header[idx].strip()
-        col.duplicate_name = source.header.count(source.header[idx]) > 1
-        col.raw_name = source.header[idx].strip()
+    for idx, acc in enumerate(accumulators):
+        col = acc.finish()
+        col.raw_name = stream.header[idx].strip()
+        col.empty_name = not col.raw_name
+        col.duplicate_name = header_counts[col.raw_name] > 1
         columns.append(col)
 
-    # Whole-row duplicates.
-    seen_rows: set[tuple[str, ...]] = set()
-    duplicates = 0
-    for row in source.rows:
-        key = tuple(row)
-        if key in seen_rows:
-            duplicates += 1
-        else:
-            seen_rows.add(key)
+    _attach_row_aligned_samples(columns, corr_rows)
 
     profile = Profile(
         path=str(path),
-        fmt=source.fmt,
-        encoding=source.encoding,
-        delimiter=source.delimiter,
-        size=source.size,
-        rows=len(source.rows),
+        fmt=stream.fmt,
+        encoding=stream.encoding,
+        delimiter=stream.delimiter,
+        size=stream.size,
+        rows=row_count,
         cols=len(names),
         columns=columns,
         issues=[],
         score=100,
         duplicate_rows=duplicates,
-        empty_rows=source.empty_rows,
-        ragged_rows=source.ragged_rows,
-        preview=source.rows[:PREVIEW_ROWS],
+        empty_rows=stream.stats.empty,
+        ragged_rows=stream.stats.ragged,
+        preview=preview,
         header=names,
         elapsed=0.0,
-        truncated=limit is not None and len(source.rows) >= limit,
+        truncated=limit is not None and row_count >= limit,
+        duplicate_scan_capped=dedup_capped,
     )
     profile.correlations = compute_correlations(columns)
     profile.issues = find_issues(profile)
@@ -1262,6 +1746,8 @@ def column_summary(col: ColumnProfile) -> str:
         value, count = col.top_values[0]
         share = count / max(col.total - col.missing, 1)
         return f"最常见「{truncate(value, 18)}」{share:.0%}"
+    if col.distinct_capped:
+        return "取值几乎都不同（ID / 自由文本）"
     return "—"
 
 
@@ -1328,7 +1814,7 @@ def render_terminal(profile: Profile, show_preview: bool = False) -> str:
             truncate(col.name, 22),
             col.kind,
             miss_cell,
-            f"{col.distinct:,}",
+            f"≥{col.distinct:,}" if col.distinct_capped else f"{col.distinct:,}",
             truncate(column_summary(col), 34),
         ])
     lines.extend("  " + line for line in render_table(headers, rows, ["left", "left", "right", "right", "left"]))
@@ -1361,6 +1847,16 @@ def render_terminal(profile: Profile, show_preview: bool = False) -> str:
         lines.append("")
     else:
         lines.append("  " + tint("没有发现质量问题。", "32"))
+        lines.append("")
+
+    sampled = [col.name for col in profile.columns if col.approximate]
+    if sampled:
+        lines.append("  " + dim(
+            f"中位数 / 分位数 / 直方图取自 {MAX_VALUES:,} 个随机抽样值"
+            f"（{truncate('、'.join(sampled[:3]), 40)}"
+            f"{' 等' if len(sampled) > 3 else ''}）；"
+            f"最小值、最大值、均值、标准差、缺失数仍是精确值"
+        ))
         lines.append("")
 
     if show_preview:
@@ -1438,6 +1934,7 @@ td.num{text-align:right}
 footer{margin-top:48px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);
   font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 .empty-note{color:var(--muted);font-size:13.5px}
+.note{color:var(--muted);font-size:12.5px;line-height:1.6;margin:14px 0 0}
 .corr-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
 .corr{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;
   display:flex;align-items:center;gap:8px;font-size:12.5px;font-family:ui-monospace,Consolas,monospace}
@@ -1510,12 +2007,12 @@ def _score_ring(score: int) -> str:
 def _column_card(col: ColumnProfile) -> str:
     items: list[str] = []
     items.append(f"<dt>缺失</dt><dd>{col.missing_rate:.1%}</dd>")
-    items.append(f"<dt>唯一值</dt><dd>{col.distinct:,}</dd>")
+    items.append(f"<dt>唯一值</dt><dd>{'≥' if col.distinct_capped else ''}{col.distinct:,}</dd>")
 
     if col.kind in ("int", "float") and col.num_min is not None:
         items.append(f"<dt>范围</dt><dd>{col.num_min:g} ~ {col.num_max:g}</dd>")
         items.append(f"<dt>均值</dt><dd>{col.num_mean:,.2f}</dd>")
-        items.append(f"<dt>中位数</dt><dd>{col.num_median:,.2f}</dd>")
+        items.append(f"<dt>中位数</dt><dd>{col.num_median:,.2f}{'*' if col.approximate else ''}</dd>")
         items.append(f"<dt>标准差</dt><dd>{col.num_std:,.2f}</dd>")
         if col.num_outliers:
             items.append(f"<dt>离群值</dt><dd>{col.num_outliers:,}</dd>")
@@ -1562,6 +2059,14 @@ def render_html(profile: Profile) -> str:
         issues_block = '<div class="empty-note">没有发现质量问题，这份数据很干净。</div>'
 
     cards = "".join(_column_card(col) for col in profile.columns)
+
+    sampled = [col.name for col in profile.columns if col.approximate]
+    sampled_note = (
+        f'<p class="note">带 * 的中位数与直方图取自 {MAX_VALUES:,} 个随机抽样值'
+        f'（{"、".join(_esc(n) for n in sampled[:5])}{" 等" if len(sampled) > 5 else ""}）。'
+        f'最小值、最大值、均值、标准差、缺失数都是精确值。</p>'
+        if sampled else ""
+    )
 
     if profile.correlations:
         corr_items = []
@@ -1632,6 +2137,7 @@ def render_html(profile: Profile) -> str:
 
 <h2>列概览 · {profile.cols} 列</h2>
 <div class="grid">{cards}</div>
+{sampled_note}
 
 {corr_block}
 
@@ -1680,6 +2186,8 @@ def render_json(profile: Profile) -> str:
                 "missing": c.missing,
                 "missing_rate": round(c.missing_rate, 4),
                 "distinct": c.distinct,
+                "distinct_capped": c.distinct_capped,
+                "approximate": c.approximate,
                 "min": c.num_min, "max": c.num_max, "mean": c.num_mean,
                 "median": c.num_median, "std": c.num_std, "outliers": c.num_outliers,
                 "date_min": c.date_min, "date_max": c.date_max,
@@ -1917,6 +2425,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_or_report(target: Path, write) -> bool:
+    """Run a writer, turning a bad path into a message instead of a traceback.
+
+    Creates missing parent directories first: if someone types
+    ``-o reports/march/data.html`` they mean it, and failing on the folder
+    alone is not useful.
+    """
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write(target)
+    except OSError as exc:
+        print(f"错误：写不进 {target}（{exc.strerror or exc}）", file=sys.stderr)
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     _configure_output()
     args = build_parser().parse_args(argv)
@@ -1958,14 +2482,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         target = (Path(args.output).expanduser() if args.output
                   else path.with_name(f"{path.stem}.cleaned.csv"))
-        write_clean_csv(target, header, rows, bom=not args.no_bom)
+        if not _write_or_report(target, lambda t: write_clean_csv(t, header, rows, bom=not args.no_bom)):
+            return 2
         fix_report.output = target
         print(render_fix_report(fix_report))
         return 0
 
     if args.output:
         target = Path(args.output).expanduser()
-        target.write_text(render_html(profile), encoding="utf-8")
+        if not _write_or_report(target, lambda t: t.write_text(render_html(profile), encoding="utf-8")):
+            return 2
         print(f"  HTML 报告已写入 {target}\n")
     else:
         print(dim("  -o report.html 生成网页报告  ·  --fix 清洗数据\n"))
