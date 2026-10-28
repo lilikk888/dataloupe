@@ -1141,9 +1141,16 @@ class ColumnAccumulator:
             self._distinct_count = len(values)
             values.clear()
 
+        # Formula injection is a security check, so it runs on every value
+        # rather than a sample. The one-character prefix test keeps it cheap;
+        # only cells that could possibly be formulas reach the full check.
+        first = text[0]
+        if first in "=@+-" and looks_like_formula(text):
+            self._formula += 1
+
         if self._hygiene_seen < HYGIENE_SAMPLE:
             self._hygiene_seen += 1
-            self._check_hygiene(value, text)
+            self._check_hygiene(value)
 
         if self.kind is None:
             self._head.append(text)
@@ -1217,9 +1224,7 @@ class ColumnAccumulator:
         if length > self._max_len:
             self._max_len = length
 
-    def _check_hygiene(self, value: str, text: str) -> None:
-        if looks_like_formula(text):
-            self._formula += 1
+    def _check_hygiene(self, value: str) -> None:
         if value[:1].isspace():
             self._leading += 1
         if value[-1:].isspace():
