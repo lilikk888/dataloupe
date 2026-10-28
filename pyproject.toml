@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataloupe"
+version = "1.0.0"
+description = "Zero-dependency data file profiler. See through any CSV, TSV, JSONL, JSON or XLSX file."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "lilikk888" }]
+keywords = ["csv", "data-quality", "profiling", "cli", "excel", "no-dependencies", "data-cleaning"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/lilikk888/dataloupe"
+Issues = "https://github.com/lilikk888/dataloupe/issues"
+
+[project.scripts]
+dataloupe = "dataloupe:main"
+
+[tool.setuptools]
+py-modules = ["dataloupe"]

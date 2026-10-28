@@ -1,0 +1,217 @@
+# dataloupe
+
+**See through any data file.** One command, zero dependencies, no setup.
+
+Point it at a CSV, TSV, JSONL, JSON, or XLSX file and it tells you what is
+actually inside: the encoding, the delimiter, what each column really contains,
+and — more importantly — **what is wrong with it**.
+
+```bash
+python dataloupe.py sales.csv
+```
+
+```
+  dataloupe  v1.0.0
+
+  messy.csv
+  CSV · UTF-8 · 逗号分隔 · 4.1KB
+  67 行 × 8 列 · 用时 0.02s
+
+  体检评分   54 / 100  ████████████░░░░░░░░░░  需要清理
+
+  问题：严重 4  警告 3  提示 2
+
+  列名      类型   缺失  唯一值  内容摘要
+  ────────  ─────  ────  ──────  ────────────────────────────
+  id        int      0%      61  2000 ~ 2999，均值 2,041.55
+  客户名称  text     0%       6  最常见「赵六」27%
+  金额      float   22%      44  100 ~ 8999.79，均值 3,719.03
+  日期      date    12%      50  2024-01-12 ~ 2024-12-22
+  状态      text     0%       3  最常见「处理中」37%
+  列7       empty  100%       0  （无数据）
+
+  发现的问题
+  ● 严重  列名重复
+      「状态」出现了 2 次，读取时后一列会覆盖前一列
+      → 重命名后重新导出，否则按列名取值只会拿到其中一列
+  ● 警告  存在重复行
+      6 行（9.0%）与其他行完全相同
+      → 去重前先确认重复是采集错误还是业务上本就允许
+```
+
+Add `-o report.html` and you get a single, self-contained web report — charts,
+column cards, and a prioritised list of fixes. No server, no CDN, no internet.
+
+---
+
+## Why another profiler?
+
+`pandas-profiling` / `ydata-profiling` and `sweetviz` are good tools. They also
+pull in pandas, numpy, matplotlib, and a few dozen transitive dependencies —
+hundreds of megabytes — just to answer "is this CSV clean?".
+
+`dataloupe` is **one file, standard library only**.
+
+| | ydata-profiling / sweetviz | **dataloupe** |
+|---|---|---|
+| Install | `pip install` + pandas/numpy/matplotlib | **copy one file** |
+| Dependencies | dozens | **zero** |
+| Startup | several seconds | ~0.1s |
+| 500k rows × 5 cols | minutes | **2.6s** (measured) |
+| GBK / GB18030 input | often breaks | auto-detected |
+| Reads .xlsx | needs openpyxl | built in (zip + xml) |
+| Output | heavy HTML | single-file HTML, works offline |
+
+It is not a replacement for a full profiling library. It is what you reach for
+when you just got a file and want to know whether it is usable — before you
+write a single line of analysis code.
+
+---
+
+## Quick start
+
+```bash
+# Terminal summary
+python dataloupe.py data.csv
+
+# Also write a standalone HTML report
+python dataloupe.py data.csv -o report.html
+
+# Machine-readable output for scripts and CI
+python dataloupe.py data.csv --json
+
+# Peek at the first rows while you are here
+python dataloupe.py data.csv --preview
+
+# Sample a huge file instead of reading all of it
+python dataloupe.py huge.csv --limit 100000
+```
+
+Exit codes make it usable as a CI gate:
+
+| Code | Meaning |
+|---|---|
+| `0` | no high-severity issues |
+| `1` | high-severity issues found |
+| `2` | file missing or unreadable |
+
+```yaml
+# Example: fail the build when incoming data is broken
+- run: python dataloupe.py data/export.csv --json
+```
+
+---
+
+## What it checks
+
+**Parsing**
+- Encoding: UTF-8, UTF-8 with BOM, UTF-16, GB18030, GBK, Big5, CP1252
+- Delimiter: comma, tab, semicolon, pipe — chosen by per-line consistency
+- Ragged rows (field count ≠ header)
+- Duplicate and empty column names
+
+**Column types**
+`int` · `float` · `bool` · `date` · `text` · `empty`, inferred with a 95%
+tolerance so a handful of dirty cells do not flip a numeric column to text.
+
+**Quality**
+- Missing rate per column
+- Fully duplicated rows
+- Mixed-type columns (how many values do not match the inferred type)
+- Leading/trailing whitespace
+- Full-width ASCII (`１２３`, `ＡＢＣ`) that silently breaks parsing
+- Invisible control characters
+- Constant columns, near-unique ID columns, auto-increment sequences
+- Outliers by the 1.5 × IQR rule
+- Numeric distribution, mean/median/std, histograms
+
+Every finding comes with a **suggested fix**, because "column X has 43% nulls"
+is not actionable on its own.
+
+---
+
+## Supported formats
+
+| Format | Extension | Notes |
+|---|---|---|
+| CSV | `.csv` `.txt` | delimiter auto-detected |
+| TSV | `.tsv` | |
+| JSON Lines | `.jsonl` `.ndjson` | keys unioned across records |
+| JSON | `.json` | array of objects, or `{"data": [...]}` |
+| Excel | `.xlsx` `.xlsm` | first worksheet, shared strings, dates via style |
+
+`.xls` (the old binary format) is **not** supported — it is a different,
+proprietary container. Re-save as `.xlsx` or CSV.
+
+---
+
+## The score
+
+100 points, minus penalties:
+
+| Severity | Penalty | Examples |
+|---|---|---|
+| high | −10 | empty column, duplicate column name, ragged rows, >50% missing |
+| medium | −4 | duplicate rows, mixed types, 20–50% missing, control characters |
+| low | −1 | stray spaces, full-width characters, constant column, outliers |
+
+It is a rough signal, not a grade. A file scoring 70 with three low-severity
+notes is usually fine; a file scoring 60 with one empty column is not.
+
+---
+
+## Install
+
+No install needed:
+
+```bash
+python dataloupe.py data.csv
+```
+
+Requires Python 3.8+. Nothing else.
+
+Optional, to get a `dataloupe` command on your PATH:
+
+```bash
+pip install .
+dataloupe data.csv
+```
+
+---
+
+## Performance
+
+Measured on Windows, Python 3.13, 500,000 rows × 5 columns (17.8 MB CSV):
+
+```
+500,000 行 × 5 列 · 用时 2.63s
+```
+
+Two things make that possible:
+
+1. **ISO date fast path** — `datetime.strptime` compiles a regex and touches the
+   locale on every call. Parsing 500k dates that way took 14 seconds; matching a
+   single regex and constructing the `datetime` directly took under one.
+2. **Sampled hygiene checks** — stray spaces, full-width characters, and control
+   characters are rare. They are detected on the first 5,000 values instead of
+   every cell.
+
+Statistics themselves are always computed over the full column.
+
+---
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+57 tests covering encoding detection, delimiter sniffing, type inference,
+statistics correctness, quality checks, xlsx parsing, HTML escaping, and CLI
+exit codes.
+
+---
+
+## License
+
+MIT

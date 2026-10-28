@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Smoke test every example
+        shell: bash
+        run: |
+          for f in examples/*; do
+            echo "--- $f"
+            python dataloupe.py "$f" --no-color || true
+          done
+
+      - name: Build the HTML report
+        run: python dataloupe.py examples/messy.csv --no-color -o /tmp/report.html
+
+      - name: Verify the report is self-contained
+        shell: bash
+        run: |
+          if grep -qE 'src="http|href="http' /tmp/report.html; then
+            echo "Report references external resources"; exit 1
+          fi
+          echo "OK: no external references"
