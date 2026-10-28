@@ -1467,6 +1467,174 @@ def render_json(profile: Profile) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cleaning (--fix)
+# ---------------------------------------------------------------------------
+
+#: Characters in the full-width ASCII block sit exactly 0xFEE0 above their
+#: half-width counterparts, so conversion is arithmetic, not a lookup table.
+FULLWIDTH_OFFSET = 0xFEE0
+
+
+def to_halfwidth(text: str) -> str:
+    """Convert full-width ASCII (１２３, ＡＢＣ, （）) to half-width."""
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if 0xFF01 <= code <= 0xFF5E:
+            out.append(chr(code - FULLWIDTH_OFFSET))
+        elif code == 0x3000:
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def strip_control(text: str) -> str:
+    """Drop control characters except tab, which is meaningful in CSV fields."""
+    return "".join(ch for ch in text if ch == "\t" or ord(ch) >= 32)
+
+
+@dataclass
+class FixReport:
+    """What the cleaning pass actually changed."""
+    output: Path
+    cells_changed: int = 0
+    whitespace: int = 0
+    fullwidth: int = 0
+    control: int = 0
+    rows_dropped: int = 0
+    cols_dropped: int = 0
+    headers_fixed: int = 0
+    rows_written: int = 0
+    cols_written: int = 0
+
+
+def clean_table(
+    header: list[str],
+    rows: list[list[str]],
+    *,
+    dedupe: bool = False,
+    drop_empty_cols: bool = False,
+    fix_headers: bool = True,
+    normalise_missing: bool = True,
+) -> tuple[list[str], list[list[str]], FixReport]:
+    """Repair the common defects dataloupe reports.
+
+    Everything here is conservative: values are trimmed and normalised, never
+    reinterpreted. A cell that held "NA" becomes empty only when it is a
+    recognised missing marker; real text is left alone.
+    """
+    report = FixReport(output=Path())
+
+    cleaned_header = list(header)
+    if fix_headers:
+        renamed: list[str] = []
+        seen: dict[str, int] = {}
+        for idx, raw in enumerate(header):
+            name = raw.strip() or f"column_{idx + 1}"
+            if name in seen:
+                seen[name] += 1
+                name = f"{name}_{seen[name]}"
+            else:
+                seen[name] = 1
+            if name != raw:
+                report.headers_fixed += 1
+            renamed.append(name)
+        cleaned_header = renamed
+
+    cleaned: list[list[str]] = []
+    for row in rows:
+        new_row = []
+        for cell in row:
+            original = cell
+            value = cell.strip()
+            if value != original:
+                report.whitespace += 1
+
+            half = to_halfwidth(value)
+            if half != value:
+                report.fullwidth += 1
+                value = half
+
+            stripped = strip_control(value)
+            if stripped != value:
+                report.control += 1
+                value = stripped
+
+            if normalise_missing and value and value.lower() in MISSING_TOKENS:
+                value = ""
+
+            if value != original:
+                report.cells_changed += 1
+            new_row.append(value)
+        cleaned.append(new_row)
+
+    if dedupe:
+        seen: set[tuple[str, ...]] = set()
+        unique_rows = []
+        for row in cleaned:
+            key = tuple(row)
+            if key in seen:
+                report.rows_dropped += 1
+                continue
+            seen.add(key)
+            unique_rows.append(row)
+        cleaned = unique_rows
+
+    kept_header = list(cleaned_header)
+    if drop_empty_cols and cleaned:
+        keep = [i for i in range(len(kept_header)) if any(row[i] for row in cleaned)]
+        if len(keep) < len(kept_header):
+            report.cols_dropped = len(kept_header) - len(keep)
+            kept_header = [kept_header[i] for i in keep]
+            cleaned = [[row[i] for i in keep] for row in cleaned]
+
+    report.rows_written = len(cleaned)
+    report.cols_written = len(kept_header)
+    return kept_header, cleaned, report
+
+
+def write_clean_csv(
+    path: Path,
+    header: list[str],
+    rows: list[list[str]],
+    *,
+    bom: bool = True,
+) -> None:
+    """Write UTF-8 CSV. A BOM by default so Excel opens it without mojibake."""
+    encoding = "utf-8-sig" if bom else "utf-8"
+    with path.open("w", encoding=encoding, newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def render_fix_report(report: FixReport) -> str:
+    lines = ["", f"  {bold('已清洗')} → {report.output}", ""]
+    if report.cells_changed:
+        parts = []
+        if report.whitespace:
+            parts.append(f"空格 {report.whitespace}")
+        if report.fullwidth:
+            parts.append(f"全角 {report.fullwidth}")
+        if report.control:
+            parts.append(f"控制字符 {report.control}")
+        detail = f"（{'、'.join(parts)}）" if parts else ""
+        lines.append(f"  修正 {report.cells_changed} 个单元格{detail}")
+    if report.rows_dropped:
+        lines.append(f"  删除 {report.rows_dropped} 行重复")
+    if report.cols_dropped:
+        lines.append(f"  删除 {report.cols_dropped} 个空列")
+    if report.headers_fixed:
+        lines.append(f"  修正 {report.headers_fixed} 个列名（空名或重名）")
+    if not (report.cells_changed or report.rows_dropped or report.cols_dropped or report.headers_fixed):
+        lines.append("  数据本来就是干净的，内容原样写出")
+    lines.append(f"  写出 {report.rows_written:,} 行 × {report.cols_written} 列")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1501,8 +1669,18 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("file", help="要分析的文件（csv/tsv/jsonl/json/xlsx）")
-    parser.add_argument("-o", "--output", metavar="HTML",
-                        help="把 HTML 报告写到这个路径")
+    parser.add_argument("-o", "--output", metavar="PATH",
+                        help="HTML 报告路径；配合 --fix 时是清洗后的数据路径")
+    parser.add_argument("--fix", action="store_true",
+                        help="清洗数据并写出新文件（默认 <原名>.cleaned.csv）")
+    parser.add_argument("--dedupe", action="store_true",
+                        help="配合 --fix：删除完全重复的行")
+    parser.add_argument("--drop-empty-cols", action="store_true",
+                        help="配合 --fix：删除整列为空的列")
+    parser.add_argument("--no-bom", action="store_true",
+                        help="配合 --fix：输出不带 BOM（默认带，方便 Excel 直接打开）")
+    parser.add_argument("--keep-headers", action="store_true",
+                        help="配合 --fix：不重命名空列名和重复列名")
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="输出 JSON（便于脚本处理）")
     parser.add_argument("--preview", action="store_true",
@@ -1544,12 +1722,28 @@ def main(argv: list[str] | None = None) -> int:
 
     print(render_terminal(profile, show_preview=args.preview))
 
+    if args.fix:
+        source = load_source(path, limit=args.limit)
+        header, rows, fix_report = clean_table(
+            source.header,
+            source.rows,
+            dedupe=args.dedupe,
+            drop_empty_cols=args.drop_empty_cols,
+            fix_headers=not args.keep_headers,
+        )
+        target = (Path(args.output).expanduser() if args.output
+                  else path.with_name(f"{path.stem}.cleaned.csv"))
+        write_clean_csv(target, header, rows, bom=not args.no_bom)
+        fix_report.output = target
+        print(render_fix_report(fix_report))
+        return 0
+
     if args.output:
         target = Path(args.output).expanduser()
         target.write_text(render_html(profile), encoding="utf-8")
         print(f"  HTML 报告已写入 {target}\n")
     else:
-        print(dim("  加 -o report.html 生成可交互的网页报告\n"))
+        print(dim("  -o report.html 生成网页报告  ·  --fix 清洗数据\n"))
 
     # Exit code reflects data health: 0 clean, 1 has high-severity issues.
     return 1 if profile.issues_by("high") else 0

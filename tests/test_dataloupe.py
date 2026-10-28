@@ -384,6 +384,112 @@ class TestOutputEncoding(unittest.TestCase):
         self.assertTrue(text.encode("utf-8"))
 
 
+class TestCleaning(unittest.TestCase):
+    def test_to_halfwidth_digits(self):
+        self.assertEqual(dl.to_halfwidth("１２３"), "123")
+
+    def test_to_halfwidth_letters_and_punct(self):
+        self.assertEqual(dl.to_halfwidth("ＡＢＣ（ｘ）"), "ABC(x)")
+
+    def test_to_halfwidth_leaves_han_alone(self):
+        self.assertEqual(dl.to_halfwidth("中文测试"), "中文测试")
+
+    def test_to_halfwidth_ideographic_space(self):
+        self.assertEqual(dl.to_halfwidth("a\u3000b"), "a b")
+
+    def test_strip_control_keeps_tab(self):
+        self.assertEqual(dl.strip_control("a\tb\x00c"), "a\tbc")
+
+    def test_clean_trims_whitespace(self):
+        header, rows, report = dl.clean_table(["a"], [["  x  "], ["y"]])
+        self.assertEqual(rows, [["x"], ["y"]])
+        self.assertEqual(report.whitespace, 1)
+
+    def test_clean_converts_fullwidth(self):
+        _, rows, report = dl.clean_table(["a"], [["１２３"]])
+        self.assertEqual(rows, [["123"]])
+        self.assertEqual(report.fullwidth, 1)
+
+    def test_clean_normalises_missing_markers(self):
+        _, rows, _ = dl.clean_table(["a"], [["NA"], ["null"], ["keep"]])
+        self.assertEqual(rows, [[""], [""], ["keep"]])
+
+    def test_clean_can_keep_missing_markers(self):
+        _, rows, _ = dl.clean_table(["a"], [["NA"]], normalise_missing=False)
+        self.assertEqual(rows, [["NA"]])
+
+    def test_clean_dedupes_rows(self):
+        _, rows, report = dl.clean_table(["a", "b"], [["1", "2"], ["1", "2"], ["3", "4"]],
+                                         dedupe=True)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(report.rows_dropped, 1)
+
+    def test_clean_drops_empty_columns(self):
+        header, rows, report = dl.clean_table(["a", "b", "c"],
+                                              [["1", "", "3"], ["4", "", "6"]],
+                                              drop_empty_cols=True)
+        self.assertEqual(header, ["a", "c"])
+        self.assertEqual(rows[0], ["1", "3"])
+        self.assertEqual(report.cols_dropped, 1)
+
+    def test_clean_renames_duplicate_headers(self):
+        header, _, report = dl.clean_table(["a", "a"], [["1", "2"]])
+        self.assertEqual(header, ["a", "a_2"])
+        self.assertEqual(report.headers_fixed, 1)
+
+    def test_clean_names_empty_headers(self):
+        header, _, _ = dl.clean_table(["a", ""], [["1", "2"]])
+        self.assertEqual(header, ["a", "column_2"])
+
+    def test_clean_keeps_headers_when_asked(self):
+        header, _, _ = dl.clean_table(["a", "a"], [["1", "2"]], fix_headers=False)
+        self.assertEqual(header, ["a", "a"])
+
+    def test_clean_reports_column_count(self):
+        _, _, report = dl.clean_table(["a", "b"], [["1", "2"]])
+        self.assertEqual(report.cols_written, 2)
+        self.assertEqual(report.rows_written, 1)
+
+
+class TestFixCli(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: [p.unlink() for p in self.dir.iterdir() if p.is_file()] and self.dir.rmdir())
+        self.source = self.dir / "dirty.csv"
+        self.source.write_text(
+            "name,amount\n  张三  ,１２３\n李四,NA\n李四,NA\n", encoding="utf-8"
+        )
+
+    def test_fix_writes_cleaned_file(self):
+        target = self.dir / "out.csv"
+        code = dl.main([str(self.source), "--no-color", "--fix", "-o", str(target),
+                        "--dedupe"])
+        self.assertEqual(code, 0)
+        self.assertTrue(target.exists())
+
+    def test_fixed_output_is_actually_cleaner(self):
+        target = self.dir / "out.csv"
+        dl.main([str(self.source), "--no-color", "--fix", "-o", str(target), "--dedupe"])
+        before = dl.analyse(self.source).score
+        after = dl.analyse(target).score
+        self.assertGreater(after, before)
+
+    def test_default_output_name(self):
+        dl.main([str(self.source), "--no-color", "--fix"])
+        expected = self.dir / "dirty.cleaned.csv"
+        self.assertTrue(expected.exists())
+
+    def test_output_has_bom_for_excel(self):
+        target = self.dir / "bom.csv"
+        dl.main([str(self.source), "--no-color", "--fix", "-o", str(target)])
+        self.assertTrue(target.read_bytes().startswith(b"\xef\xbb\xbf"))
+
+    def test_no_bom_option(self):
+        target = self.dir / "nobom.csv"
+        dl.main([str(self.source), "--no-color", "--fix", "-o", str(target), "--no-bom"])
+        self.assertFalse(target.read_bytes().startswith(b"\xef\xbb\xbf"))
+
+
 class TestCli(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())

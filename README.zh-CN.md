@@ -83,6 +83,9 @@ python dataloupe.py data.csv --preview
 
 # 超大文件只抽样
 python dataloupe.py huge.csv --limit 100000
+
+# 修好数据另存一份（原文件不动）
+python dataloupe.py data.csv --fix
 ```
 
 退出码可以直接当 CI 门禁：
@@ -97,6 +100,46 @@ python dataloupe.py huge.csv --limit 100000
 # 例：数据有问题就让构建失败
 - run: python dataloupe.py data/export.csv --json
 ```
+
+---
+
+## 清洗数据
+
+诊断只是一半，`--fix` 直接写出一份修好的副本，**原文件一个字节都不动**。
+
+```bash
+python dataloupe.py dirty.csv --fix
+# -> dirty.cleaned.csv
+
+python dataloupe.py dirty.csv --fix -o clean.csv --dedupe --drop-empty-cols
+```
+
+```
+  已清洗 → dirty.cleaned.csv
+
+  修正 51 个单元格（空格 39、全角 4）
+  删除 6 行重复
+  删除 1 个空列
+  修正 2 个列名（空名或重名）
+  写出 61 行 × 7 列
+```
+
+拿仓库里的 `examples/messy.csv` 试，分数从 **46 提到 91**——剩下的差距是缺失数据，
+那不该由工具替你编。
+
+| 修复项 | 默认 | 需要加参数 |
+|---|---|---|
+| 去首尾空格 | ✓ | |
+| 全角转半角（`１２３` → `123`） | ✓ | |
+| 去不可见控制字符 | ✓ | |
+| `NA` / `null` / `-` 统一成空 | ✓ | |
+| 空列名、重复列名 | ✓ | `--keep-headers` 可关闭 |
+| 删除重复行 | | `--dedupe` |
+| 删除整列为空 | | `--drop-empty-cols` |
+
+输出默认是 **带 BOM 的 UTF-8**，Excel 双击打开不会乱码。要接管道处理就加 `--no-bom`。
+
+它**从不猜**：不填充缺失值、不凭空造行、看着像数字的文本也原样保留。
 
 ---
 
@@ -201,7 +244,13 @@ python -m unittest discover -s tests -v
 ```
 
 57 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、质量检测、
-xlsx 解析、HTML 转义、CLI 退出码。
+数据清洗、xlsx 解析、HTML 转义、CLI 退出码。
+
+```
+Ran 79 tests in 0.43s
+
+OK
+```
 
 ---
 

@@ -85,6 +85,9 @@ python dataloupe.py data.csv --preview
 
 # Sample a huge file instead of reading all of it
 python dataloupe.py huge.csv --limit 100000
+
+# Repair the data into a new file (the original is untouched)
+python dataloupe.py data.csv --fix
 ```
 
 Exit codes make it usable as a CI gate:
@@ -99,6 +102,49 @@ Exit codes make it usable as a CI gate:
 # Example: fail the build when incoming data is broken
 - run: python dataloupe.py data/export.csv --json
 ```
+
+---
+
+## Clean it up
+
+Diagnosis is half the job. `--fix` writes a repaired copy and leaves the
+original untouched.
+
+```bash
+python dataloupe.py dirty.csv --fix
+# -> dirty.cleaned.csv
+
+python dataloupe.py dirty.csv --fix -o clean.csv --dedupe --drop-empty-cols
+```
+
+```
+  已清洗 → dirty.cleaned.csv
+
+  修正 51 个单元格（空格 39、全角 4）
+  删除 6 行重复
+  删除 1 个空列
+  修正 2 个列名（空名或重名）
+  写出 61 行 × 7 列
+```
+
+On the bundled `examples/messy.csv` this takes the score from **46 to 91** — the
+remainder is missing data, which no tool should invent for you.
+
+| Fix | Always on | Opt-in |
+|---|---|---|
+| Trim leading/trailing whitespace | ✓ | |
+| Full-width ASCII → half-width (`１２３` → `123`) | ✓ | |
+| Remove control characters | ✓ | |
+| `NA` / `null` / `-` → empty | ✓ | |
+| Empty and duplicate column names | ✓ | `--keep-headers` disables |
+| Duplicate rows | | `--dedupe` |
+| Fully empty columns | | `--drop-empty-cols` |
+
+Output is UTF-8 **with a BOM** by default, so Excel opens it without mojibake.
+Use `--no-bom` for pipelines that would choke on the marker.
+
+It never guesses. Nothing is imputed, no rows are invented, and text that merely
+looks numeric is left alone.
 
 ---
 
@@ -207,8 +253,14 @@ python -m unittest discover -s tests -v
 ```
 
 57 tests covering encoding detection, delimiter sniffing, type inference,
-statistics correctness, quality checks, xlsx parsing, HTML escaping, and CLI
-exit codes.
+statistics correctness, quality checks, cleaning, xlsx parsing, HTML escaping,
+and CLI exit codes.
+
+```
+Ran 79 tests in 0.43s
+
+OK
+```
 
 ---
 
