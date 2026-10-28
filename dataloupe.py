@@ -533,7 +533,19 @@ def _read_json_array(text: str, limit: int | None) -> tuple[list[str], list[list
                 if key not in header:
                     header.append(key)
     if not header:
-        return [], []
+        if not data:
+            return [], []
+        # A flat array of scalars — [1, 2, 3] — is a one-column table, not an
+        # error. Saying "no header row" to that would be unhelpful.
+        rows = []
+        for record in data:
+            if isinstance(record, (dict, list)):
+                rows.append([json.dumps(record, ensure_ascii=False)])
+            elif record is None:
+                rows.append([""])
+            else:
+                rows.append([str(record)])
+        return ["value"], rows
     rows = []
     for record in data:
         if not isinstance(record, dict):
@@ -1397,6 +1409,13 @@ def find_issues(profile: Profile) -> list[Issue]:
     """Turn raw statistics into a prioritised, actionable list."""
     issues: list[Issue] = []
     rows = max(profile.rows, 1)
+
+    if profile.rows == 0:
+        issues.append(Issue(
+            "high", "没有数据行",
+            "文件只有表头，一行数据都没有",
+            suggestion="确认导出是否中断；如果确实没有数据，下游会静默得到一张空表",
+        ))
 
     if profile.ragged_rows:
         issues.append(Issue(
@@ -2638,6 +2657,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         target = (Path(args.output).expanduser() if args.output
                   else path.with_name(f"{path.stem}.cleaned.csv"))
+        # The one promise --fix makes is that the source survives. Typing the
+        # input path into -o would quietly break it.
+        try:
+            same_file = target.resolve() == path.resolve()
+        except OSError:
+            same_file = False
+        if same_file:
+            print(f"错误：输出路径和输入是同一个文件（{target}）\n"
+                  f"      --fix 不覆盖原文件，请换一个 -o 路径", file=sys.stderr)
+            return 2
         if not _write_or_report(target, lambda t: write_clean_csv(t, header, rows, bom=not args.no_bom)):
             return 2
         fix_report.output = target

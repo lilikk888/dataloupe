@@ -977,5 +977,54 @@ class TestSqlOutput(unittest.TestCase):
         self.assertEqual(dl.main([str(path), "--no-color", "--fail-under", "101"]), 1)
 
 
+class TestEdgeCases(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def test_header_only_file_is_flagged(self):
+        path = self.directory / "header.csv"
+        path.write_text("a,b,c\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual(profile.rows, 0)
+        titles = [issue.title for issue in profile.issues]
+        self.assertIn("没有数据行", titles)
+        self.assertLess(profile.score, 100)
+
+    def test_flat_json_array_becomes_one_column(self):
+        path = self.directory / "flat.json"
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual(profile.rows, 3)
+        self.assertEqual(profile.header, ["value"])
+        self.assertEqual(profile.columns[0].kind, "int")
+
+    def test_fix_refuses_to_overwrite_the_source(self):
+        path = self.directory / "data.csv"
+        path.write_text("a,b\n 1 ,2\n", encoding="utf-8")
+        before = path.read_bytes()
+        self.assertEqual(dl.main([str(path), "--no-color", "--fix", "-o", str(path)]), 2)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_single_column_file(self):
+        path = self.directory / "one.csv"
+        path.write_text("a\n1\n2\n3\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual((profile.rows, profile.cols), (3, 1))
+
+    def test_quoted_delimiter_inside_a_field(self):
+        path = self.directory / "q.csv"
+        path.write_text('a,b\n"x,y",2\n', encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual(profile.cols, 2)
+        self.assertEqual(profile.preview[0][0], "x,y")
+
+    def test_empty_file_is_an_error_not_a_crash(self):
+        path = self.directory / "empty.csv"
+        path.write_bytes(b"")
+        with self.assertRaises(ValueError):
+            dl.analyse(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
