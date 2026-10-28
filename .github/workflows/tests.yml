@@ -23,24 +23,48 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Run test suite
+      - name: Test suite
         run: python -m unittest discover -s tests -v
 
-      - name: Smoke test every example
+      - name: Analyse every example
         shell: bash
         run: |
           for f in examples/*; do
-            echo "--- $f"
+            echo "::group::$f"
             python dataloupe.py "$f" --no-color || true
+            echo "::endgroup::"
           done
 
-      - name: Build the HTML report
-        run: python dataloupe.py examples/messy.csv --no-color -o /tmp/report.html
-
-      - name: Verify the report is self-contained
+      - name: Clean data exits 0 and writes a report
         shell: bash
         run: |
-          if grep -qE 'src="http|href="http' /tmp/report.html; then
-            echo "Report references external resources"; exit 1
+          python dataloupe.py examples/sales.csv --no-color -o report.html
+          test -s report.html
+
+      - name: Broken data exits 1
+        shell: bash
+        run: |
+          set +e
+          python dataloupe.py examples/messy.csv --no-color -o messy.html
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit code 1 for messy.csv, got $code"
+            exit 1
+          fi
+
+      - name: Report is self-contained
+        shell: bash
+        run: |
+          if grep -qE '(src|href)="https?://' report.html; then
+            echo "::error::report references external resources"
+            exit 1
           fi
           echo "OK: no external references"
+
+      - name: Survives a legacy Windows code page
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          PYTHONIOENCODING=cp1252 python dataloupe.py examples/sales.csv --no-color > /dev/null
+          echo "OK: cp1252 safe"

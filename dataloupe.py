@@ -1470,6 +1470,25 @@ def render_json(profile: Profile) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _configure_output() -> None:
+    """Force UTF-8 on stdout and stderr.
+
+    Windows defaults to the system code page, which on an English install is
+    cp1252 — a charset that cannot represent any Chinese character. Printing
+    the report then dies with UnicodeEncodeError. Reconfiguring the streams
+    fixes it for every locale, including CI runners.
+
+    ``errors="replace"`` is the last line of defence: if a terminal genuinely
+    cannot render a character, print a placeholder instead of crashing.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # Not a real stream (captured by a test runner), or already closed.
+            pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dataloupe",
@@ -1496,6 +1515,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_output()
     args = build_parser().parse_args(argv)
 
     global USE_COLOR

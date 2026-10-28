@@ -365,6 +365,25 @@ class TestRendering(unittest.TestCase):
         self.assertIn("score", payload)
 
 
+class TestOutputEncoding(unittest.TestCase):
+    """Regression tests for the cp1252 crash on English Windows installs."""
+
+    def test_configure_output_survives_streams_without_reconfigure(self):
+        import io
+        original = sys.stdout
+        sys.stdout = io.StringIO()  # StringIO has no .reconfigure
+        try:
+            dl._configure_output()  # must not raise
+        finally:
+            sys.stdout = original
+
+    def test_chinese_report_is_encodable_as_utf8(self):
+        # The report contains Chinese labels; it must always be encodable.
+        profile = dl.analyse(Path(__file__).resolve().parent.parent / "examples" / "sales.csv")
+        text = dl.render_terminal(profile)
+        self.assertTrue(text.encode("utf-8"))
+
+
 class TestCli(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
