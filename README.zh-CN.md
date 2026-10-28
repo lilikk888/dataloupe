@@ -2,6 +2,11 @@
 
 **一条命令，看清任何数据文件。** 零依赖，零配置，一个文件。
 
+[![tests](https://github.com/lilikk888/dataloupe/actions/workflows/tests.yml/badge.svg)](https://github.com/lilikk888/dataloupe/actions/workflows/tests.yml)
+[![python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 ![dataloupe 输出](docs/terminal.svg)
 
 给它一个 CSV / TSV / JSONL / JSON / XLSX，它告诉你里面到底是什么：编码、
@@ -98,13 +103,18 @@ python dataloupe.py data.csv --fix
 
 | 退出码 | 含义 |
 |---|---|
-| `0` | 没有严重问题 |
-| `1` | 有严重问题 |
+| `0` | 没有严重问题（且评分达到 `--fail-under`） |
+| `1` | 有严重问题，或评分低于 `--fail-under` |
 | `2` | 文件不存在或读不了 |
 
+`--json` 也遵守这套退出码，所以 CI 里直接拿它当门禁：
+
 ```yaml
-# 例：数据有问题就让构建失败
+# 只要有严重问题就构建失败
 - run: python dataloupe.py data/export.csv --json
+
+# 或者按分数卡线：低于 85 分就失败
+- run: python dataloupe.py data/export.csv --fail-under 85
 ```
 
 ---
@@ -337,12 +347,12 @@ for row in rows:              # 一次只持有一行
 python -m unittest discover -s tests -v
 ```
 
-129 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
-流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、质量检测、数据清洗、
+131 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
+流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、退出码与 CI 门禁、质量检测、数据清洗、
 xlsx 解析、HTML 转义、CLI 退出码。
 
 ```
-Ran 129 tests in 7.68s
+Ran 131 tests in 7.21s
 
 OK
 ```

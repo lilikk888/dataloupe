@@ -2,6 +2,11 @@
 
 **See through any data file.** One command, zero dependencies, no setup.
 
+[![tests](https://github.com/lilikk888/dataloupe/actions/workflows/tests.yml/badge.svg)](https://github.com/lilikk888/dataloupe/actions/workflows/tests.yml)
+[![python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 ![dataloupe output](docs/terminal.svg)
 
 Point it at a CSV, TSV, JSONL, JSON, or XLSX file and it tells you what is
@@ -100,13 +105,18 @@ Exit codes make it usable as a CI gate:
 
 | Code | Meaning |
 |---|---|
-| `0` | no high-severity issues |
-| `1` | high-severity issues found |
+| `0` | no high-severity issues (and the score clears `--fail-under`) |
+| `1` | high-severity issues found, or the score is below `--fail-under` |
 | `2` | file missing or unreadable |
 
+`--json` follows the same exit codes, so it works directly as a CI gate:
+
 ```yaml
-# Example: fail the build when incoming data is broken
+# Fail the build when incoming data is broken
 - run: python dataloupe.py data/export.csv --json
+
+# Or gate on the score: anything under 85 fails
+- run: python dataloupe.py data/export.csv --fail-under 85
 ```
 
 ---
@@ -358,13 +368,13 @@ Three things make it fast:
 python -m unittest discover -s tests -v
 ```
 
-129 tests covering encoding detection, delimiter sniffing, type inference,
+131 tests covering encoding detection, delimiter sniffing, type inference,
 statistics correctness, correlation, streaming-vs-one-shot equivalence,
-reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, quality checks, cleaning, xlsx parsing, HTML escaping, and
+reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, exit codes, quality checks, cleaning, xlsx parsing, HTML escaping, and
 CLI exit codes.
 
 ```
-Ran 129 tests in 7.68s
+Ran 131 tests in 7.21s
 
 OK
 ```

@@ -962,6 +962,20 @@ class TestSqlOutput(unittest.TestCase):
         path.write_text("a,a\n1,2\n", encoding="utf-8")
         self.assertEqual(dl.main([str(path), "--no-color", "--sql", "postgres"]), 0)
 
+    def test_json_honours_the_exit_code(self):
+        # The README advertises --json as a CI gate, so it has to fail the build.
+        bad = self.directory / "bad.csv"
+        bad.write_text("a,a\n1,2\n", encoding="utf-8")
+        self.assertEqual(dl.main([str(bad), "--no-color", "--json"]), 1)
+
+    def test_fail_under_gates_on_the_score(self):
+        path = self.directory / "ok.csv"
+        path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+        self.assertEqual(dl.main([str(path), "--no-color", "--fail-under", "50"]), 0)
+        # The threshold is inclusive: a score of exactly 100 passes a bar of 100.
+        self.assertEqual(dl.main([str(path), "--no-color", "--fail-under", "100"]), 0)
+        self.assertEqual(dl.main([str(path), "--no-color", "--fail-under", "101"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

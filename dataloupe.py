@@ -2557,6 +2557,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="终端里额外打印前 20 行数据")
     parser.add_argument("--limit", type=int, default=None, metavar="N",
                         help="最多读取 N 行（大文件快速抽样）")
+    parser.add_argument("--fail-under", type=int, default=None, metavar="SCORE",
+                        help="评分低于 SCORE 时以退出码 1 结束（配合 CI 用）")
     parser.add_argument("--no-color", action="store_true", help="关闭颜色")
     parser.add_argument("--version", action="version", version=f"dataloupe {__version__}")
     return parser
@@ -2602,11 +2604,19 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
 
+    # Exit code reflects data health: 0 clean, 1 has high-severity issues or
+    # scored below --fail-under. --json honours it too, because that is the
+    # form a CI gate consumes.
+    failed = bool(profile.issues_by("high"))
+    if args.fail_under is not None and profile.score < args.fail_under:
+        failed = True
+
     if args.as_json:
         print(render_json(profile))
-        return 0
+        return 1 if failed else 0
 
     if args.sql:
+        # A code generator: dirty data does not stop the schema from existing.
         print(render_sql(profile, args.sql, args.table))
         return 0
 
@@ -2637,8 +2647,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(dim("  -o report.html 生成网页报告  ·  --fix 清洗数据\n"))
 
-    # Exit code reflects data health: 0 clean, 1 has high-severity issues.
-    return 1 if profile.issues_by("high") else 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
