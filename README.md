@@ -2,6 +2,8 @@
 
 **See through any data file.** One command, zero dependencies, no setup.
 
+![dataloupe output](docs/terminal.svg)
+
 Point it at a CSV, TSV, JSONL, JSON, or XLSX file and it tells you what is
 actually inside: the encoding, the delimiter, what each column really contains,
 and — more importantly — **what is wrong with it**.
