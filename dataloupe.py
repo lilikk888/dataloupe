@@ -63,6 +63,18 @@ HIST_BUCKETS = 24
 #: nothing: these are rare-character detections, not exact counts.
 HYGIENE_SAMPLE = 5000
 
+#: Values kept per numeric column for pairwise correlation.
+CORRELATION_SAMPLE = 5000
+
+#: Correlation is O(n^2) over columns; cap how many numeric columns we compare.
+MAX_CORRELATION_COLUMNS = 40
+
+#: |r| below this is not worth reporting.
+CORRELATION_REPORT_THRESHOLD = 0.5
+
+#: |r| above this means the two columns carry essentially the same information.
+CORRELATION_REDUNDANT_THRESHOLD = 0.98
+
 INT_RE = re.compile(r"^[+-]?\d{1,20}$")
 FLOAT_RE = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?$")
 
@@ -669,6 +681,7 @@ class ColumnProfile:
     num_outliers: int = 0
     histogram: list[int] = field(default_factory=list)
     hist_edges: list[float] = field(default_factory=list)
+    values_sample: list[float] = field(default_factory=list)
     # text
     top_values: list[tuple[str, int]] = field(default_factory=list)
     min_len: int = 0
@@ -712,6 +725,7 @@ class Profile:
     preview: list[list[str]]
     header: list[str]
     elapsed: float
+    correlations: list[tuple[str, str, float]] = field(default_factory=list)
     truncated: bool = False
 
     def issues_by(self, severity: str) -> list[Issue]:
@@ -810,6 +824,8 @@ def profile_column(name: str, index: int, values: list[str]) -> ColumnProfile:
                 high_fence = col.num_q3 + 1.5 * iqr
                 col.num_outliers = sum(1 for n in numbers if n < low_fence or n > high_fence)
             col.histogram, col.hist_edges = histogram(numbers)
+            # Keep a bounded sample for pairwise correlation.
+            col.values_sample = numbers[:CORRELATION_SAMPLE]
 
     elif col.kind == "date":
         stamps = [d for d in (parse_date(v) for v in non_empty) if d is not None]
@@ -829,6 +845,50 @@ def profile_column(name: str, index: int, values: list[str]) -> ColumnProfile:
         col.top_values = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
 
     return col
+
+
+# ---------------------------------------------------------------------------
+# Correlation
+# ---------------------------------------------------------------------------
+
+def pearson(xs: list[float], ys: list[float]) -> float | None:
+    """Pearson correlation coefficient, or None when it is undefined.
+
+    Undefined means: fewer than 3 paired values, or either series is constant
+    (zero variance), where the formula divides by zero.
+    """
+    n = min(len(xs), len(ys))
+    if n < 3:
+        return None
+    mean_x = sum(xs[:n]) / n
+    mean_y = sum(ys[:n]) / n
+    numerator = var_x = var_y = 0.0
+    for x, y in zip(xs[:n], ys[:n]):
+        dx = x - mean_x
+        dy = y - mean_y
+        numerator += dx * dy
+        var_x += dx * dx
+        var_y += dy * dy
+    if var_x <= 0 or var_y <= 0:
+        return None
+    return numerator / math.sqrt(var_x * var_y)
+
+
+def compute_correlations(columns: list[ColumnProfile]) -> list[tuple[str, str, float]]:
+    """All column pairs whose |r| clears the reporting threshold, strongest first."""
+    numeric = [
+        col for col in columns
+        if col.kind in ("int", "float") and len(col.values_sample) >= 3
+    ][:MAX_CORRELATION_COLUMNS]
+
+    pairs: list[tuple[str, str, float]] = []
+    for i in range(len(numeric)):
+        for j in range(i + 1, len(numeric)):
+            r = pearson(numeric[i].values_sample, numeric[j].values_sample)
+            if r is not None and abs(r) >= CORRELATION_REPORT_THRESHOLD:
+                pairs.append((numeric[i].name, numeric[j].name, r))
+    pairs.sort(key=lambda item: -abs(item[2]))
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +1000,40 @@ def find_issues(profile: Profile) -> list[Issue]:
                                     f"「{label}」有 {col.num_outliers} 个值落在 1.5×IQR 之外（{rate:.1%}）",
                                     column=col.name, suggestion="先确认是录入错误还是真实极值，再决定是否剔除"))
 
+    # Near-perfectly correlated columns form one group. Reporting every pair
+    # would emit three warnings for the same finding (A-B, A-C, B-C).
+    parent: dict[str, str] = {}
+
+    def find(name: str) -> str:
+        parent.setdefault(name, name)
+        root = name
+        while parent[root] != root:
+            root = parent[root]
+        while parent[name] != root:      # path compression
+            parent[name], name = root, parent[name]
+        return root
+
+    for a, b, r in profile.correlations:
+        if abs(r) >= CORRELATION_REDUNDANT_THRESHOLD:
+            root_a, root_b = find(a), find(b)
+            if root_a != root_b:
+                parent[root_b] = root_a
+
+    groups: dict[str, list[str]] = {}
+    for name in list(parent):
+        groups.setdefault(find(name), []).append(name)
+
+    for members in groups.values():
+        if len(members) > 1:
+            quoted = "、".join(f"「{m}」" for m in members)
+            issues.append(Issue(
+                "medium", "疑似冗余列组",
+                f"{quoted} 互相高度相关（|r| ≥ {CORRELATION_REDUNDANT_THRESHOLD}）",
+                column=members[0],
+                suggestion="这一组列携带同样的信息，保留一个即可；"
+                           "否则建模时同一个因素会被重复计算",
+            ))
+
     order = {"high": 0, "medium": 1, "low": 2}
     issues.sort(key=lambda i: (order[i.severity], i.column or ""))
     return issues
@@ -1010,6 +1104,7 @@ def analyse(path: Path, limit: int | None = None) -> Profile:
         elapsed=0.0,
         truncated=limit is not None and len(source.rows) >= limit,
     )
+    profile.correlations = compute_correlations(columns)
     profile.issues = find_issues(profile)
     profile.score = score_quality(profile.issues)
     profile.elapsed = time.perf_counter() - started
@@ -1153,6 +1248,21 @@ def render_terminal(profile: Profile, show_preview: bool = False) -> str:
     lines.extend("  " + line for line in render_table(headers, rows, ["left", "left", "right", "right", "left"]))
     lines.append("")
 
+    if profile.correlations:
+        lines.append("  " + bold("强相关列") + dim("  相关系数越接近 ±1 越像同一件事"))
+        corr_rows = []
+        for a, b, r in profile.correlations[:6]:
+            if abs(r) >= CORRELATION_REDUNDANT_THRESHOLD:
+                color = "31"
+            elif abs(r) >= 0.8:
+                color = "33"
+            else:
+                color = "2"
+            corr_rows.append([truncate(a, 16), truncate(b, 16), tint(f"{r:+.2f}", color)])
+        lines.extend("  " + line for line in render_table(
+            ["列 A", "列 B", "相关系数"], corr_rows, ["left", "left", "right"]))
+        lines.append("")
+
     if profile.issues:
         lines.append("  " + bold("发现的问题"))
         for issue in profile.issues:
@@ -1242,6 +1352,13 @@ td.num{text-align:right}
 footer{margin-top:48px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);
   font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 .empty-note{color:var(--muted);font-size:13.5px}
+.corr-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
+.corr{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;
+  display:flex;align-items:center;gap:8px;font-size:12.5px;font-family:ui-monospace,Consolas,monospace}
+.corr .pair{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.corr .arrow{color:var(--muted);font-size:11px;flex-shrink:0}
+.corr .r{margin-left:auto;font-weight:600;flex-shrink:0}
+.corr .r.bad{color:var(--bad)} .corr .r.warn{color:var(--warn)} .corr .r.ok{color:var(--muted)}
 """
 
 HTML_JS = """
@@ -1360,6 +1477,26 @@ def render_html(profile: Profile) -> str:
 
     cards = "".join(_column_card(col) for col in profile.columns)
 
+    if profile.correlations:
+        corr_items = []
+        for a, b, r in profile.correlations[:12]:
+            if abs(r) >= CORRELATION_REDUNDANT_THRESHOLD:
+                cls = "bad"
+            elif abs(r) >= 0.8:
+                cls = "warn"
+            else:
+                cls = "ok"
+            corr_items.append(
+                f'<div class="corr"><span class="pair" title="{_esc(a)}">{_esc(a)}</span>'
+                f'<span class="arrow">↔</span>'
+                f'<span class="pair" title="{_esc(b)}">{_esc(b)}</span>'
+                f'<span class="r {cls}">{r:+.2f}</span></div>'
+            )
+        corr_block = (f'<h2>强相关列 · {len(profile.correlations)} 对</h2>'
+                      f'<div class="corr-grid">{"".join(corr_items)}</div>')
+    else:
+        corr_block = ""
+
     head_cells = "".join(f"<th>{_esc(h)}</th>" for h in profile.header)
     body_rows = []
     for row in profile.preview:
@@ -1409,6 +1546,8 @@ def render_html(profile: Profile) -> str:
 
 <h2>列概览 · {profile.cols} 列</h2>
 <div class="grid">{cards}</div>
+
+{corr_block}
 
 <h2>数据预览 · 前 {len(profile.preview)} 行</h2>
 <div class="tbl-wrap"><table>

@@ -148,6 +148,25 @@ looks numeric is left alone.
 
 ---
 
+## Correlations
+
+Every pair of numeric columns gets a Pearson correlation. Pairs above |r| ≥ 0.5
+are listed; anything at |r| ≥ 0.98 is flagged as **redundant**, because keeping
+two copies of the same signal quietly distorts any model you train on it.
+
+```
+  强相关列  相关系数越接近 ±1 越像同一件事
+  列 A      列 B       相关系数
+  ────────  ─────────  ────────
+  price     price_cny     +1.00
+  area_sqm  price         +1.00
+```
+
+A set of three mutually correlated columns produces **one** finding, not three —
+near-perfectly correlated columns are grouped with a union-find before reporting.
+
+---
+
 ## What it checks
 
 **Parsing**
@@ -252,12 +271,12 @@ Statistics themselves are always computed over the full column.
 python -m unittest discover -s tests -v
 ```
 
-57 tests covering encoding detection, delimiter sniffing, type inference,
-statistics correctness, quality checks, cleaning, xlsx parsing, HTML escaping,
-and CLI exit codes.
+86 tests covering encoding detection, delimiter sniffing, type inference,
+statistics correctness, correlation, quality checks, cleaning, xlsx parsing,
+HTML escaping, and CLI exit codes.
 
 ```
-Ran 79 tests in 0.43s
+Ran 86 tests in 0.40s
 
 OK
 ```

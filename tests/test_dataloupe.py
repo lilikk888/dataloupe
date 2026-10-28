@@ -384,6 +384,51 @@ class TestOutputEncoding(unittest.TestCase):
         self.assertTrue(text.encode("utf-8"))
 
 
+class TestCorrelation(unittest.TestCase):
+    def test_perfect_positive(self):
+        r = dl.pearson([1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0])
+        self.assertAlmostEqual(r, 1.0, places=6)
+
+    def test_perfect_negative(self):
+        r = dl.pearson([1.0, 2.0, 3.0, 4.0], [8.0, 6.0, 4.0, 2.0])
+        self.assertAlmostEqual(r, -1.0, places=6)
+
+    def test_constant_series_is_undefined(self):
+        self.assertIsNone(dl.pearson([1.0, 1.0, 1.0], [1.0, 2.0, 3.0]))
+
+    def test_too_few_points(self):
+        self.assertIsNone(dl.pearson([1.0, 2.0], [1.0, 2.0]))
+
+    def test_correlations_found(self):
+        cols = [
+            dl.profile_column("a", 0, [str(i) for i in range(50)]),
+            dl.profile_column("b", 1, [str(i * 3) for i in range(50)]),
+            dl.profile_column("c", 2, [str((i * 7) % 13) for i in range(50)]),
+        ]
+        pairs = dl.compute_correlations(cols)
+        names = {frozenset((a, b)) for a, b, _ in pairs}
+        self.assertIn(frozenset(("a", "b")), names)
+
+    def test_text_columns_ignored(self):
+        cols = [
+            dl.profile_column("a", 0, [str(i) for i in range(50)]),
+            dl.profile_column("t", 1, [f"v{i % 7}" for i in range(50)]),
+        ]
+        self.assertEqual(dl.compute_correlations(cols), [])
+
+    def test_redundant_group_reported_once(self):
+        rows = [[str(i), str(i * 2), str(i * 4)] for i in range(60)]
+        path = Path(tempfile.mktemp(suffix=".csv"))
+        self.addCleanup(path.unlink, missing_ok=True)
+        path.write_text("a,b,c\n" + "\n".join(",".join(r) for r in rows) + "\n",
+                        encoding="utf-8")
+        profile = dl.analyse(path)
+        redundant = [i for i in profile.issues if i.title == "疑似冗余列组"]
+        self.assertEqual(len(redundant), 1, [i.detail for i in redundant])
+        for name in ("a", "b", "c"):
+            self.assertIn(f"「{name}」", redundant[0].detail)
+
+
 class TestCleaning(unittest.TestCase):
     def test_to_halfwidth_digits(self):
         self.assertEqual(dl.to_halfwidth("１２３"), "123")

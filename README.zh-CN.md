@@ -143,6 +143,23 @@ python dataloupe.py dirty.csv --fix -o clean.csv --dedupe --drop-empty-cols
 
 ---
 
+## 相关性
+
+每两个数值列之间都会算 Pearson 相关系数。|r| ≥ 0.5 的列出来；|r| ≥ 0.98 的
+直接判定为**冗余列**——同一个信号存两份，训练模型时会被重复计算权重，结果会歪。
+
+```
+  强相关列  相关系数越接近 ±1 越像同一件事
+  列 A      列 B       相关系数
+  ────────  ─────────  ────────
+  price     price_cny     +1.00
+  area_sqm  price         +1.00
+```
+
+三列互相高度相关时只报**一条**，不是三条——先用并查集把相关的列并成组再报告。
+
+---
+
 ## 它检查什么
 
 **解析层**
@@ -243,11 +260,11 @@ Windows / Python 3.13 / 50 万行 × 5 列（17.8 MB CSV）实测：
 python -m unittest discover -s tests -v
 ```
 
-57 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、质量检测、
-数据清洗、xlsx 解析、HTML 转义、CLI 退出码。
+86 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
+质量检测、数据清洗、xlsx 解析、HTML 转义、CLI 退出码。
 
 ```
-Ran 79 tests in 0.43s
+Ran 86 tests in 0.40s
 
 OK
 ```
