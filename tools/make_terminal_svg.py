@@ -120,13 +120,27 @@ def escape(ch: str) -> str:
     return {"&": "&amp;", "<": "&lt;", ">": "&gt;"}.get(ch, ch)
 
 
+def write(name: str, text: str) -> None:
+    target = ROOT / "docs" / name
+    target.write_text(build_svg(parse_ansi(text)), encoding="utf-8")
+    print(f"wrote {target}  ({target.stat().st_size:,} bytes)")
+
+
 def main():
     dl.USE_COLOR = True
+
     profile = dl.analyse(ROOT / "examples" / "users.csv")
-    text = dl.render_terminal(profile, show_preview=False)
-    svg = build_svg(parse_ansi(text))
-    OUT.write_text(svg, encoding="utf-8")
-    print(f"wrote {OUT}  ({OUT.stat().st_size:,} bytes)")
+    write("terminal.svg", dl.render_terminal(profile, show_preview=False))
+
+    old = dl.analyse(ROOT / "examples" / "orders_march.csv")
+    new = dl.analyse(ROOT / "examples" / "orders_april.csv")
+    diff = dl.diff_profiles(old, new)
+    diff.row_diff = dl.compare_rows(
+        ROOT / "examples" / "orders_march.csv",
+        ROOT / "examples" / "orders_april.csv",
+        [c.name for c in new.columns if c.name in {o.name for o in old.columns}],
+    )
+    write("diff.svg", dl.render_diff_terminal(diff))
 
 
 if __name__ == "__main__":

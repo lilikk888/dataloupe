@@ -97,6 +97,9 @@ python dataloupe.py huge.csv --limit 100000
 # Emit a CREATE TABLE statement from the inferred types
 python dataloupe.py data.csv --sql postgres
 
+# Redact emails / phones / ID cards into a shareable copy
+python dataloupe.py users.csv --mask
+
 # Repair the data into a new file (the original is untouched)
 python dataloupe.py data.csv --fix
 ```
@@ -203,7 +206,7 @@ defaults to the file name; `--table events` overrides it.
 
 ---
 
-## Schema drift between two exports
+## Drift: structure, distribution, rows
 
 The quietest data-pipeline accident is an overnight export that changed shape:
 downstream code either crashes or, worse, **silently computes the wrong answer**.
@@ -226,8 +229,19 @@ python dataloupe.py last_week.csv today.csv --diff
   质量退化（缺失率上升）
     ↓ note  0.0% -> 40.0%
 
+  分布漂移（数值中心明显移动）
+    ≠ amount         均值 107.56 -> 403.86  (+275%)
+    ≠ shipping_days  均值 2.93 -> 4.53  (+55%)
+
+  行级差异  按共有的 5 列比对（不同行，非行数）
+    + 2 行只出现在新文件
+    - 2 行只出现在旧文件
+      共有 3 行
+
   结论：破坏性变更。
 ```
+
+![drift report](docs/diff.svg)
 
 What it catches:
 
@@ -238,11 +252,52 @@ What it catches:
 | Type change | `int` -> `text` is breaking; `int` <-> `float` is treated as compatible |
 | **Type pollution** | The inferred type stays put but unparseable values (`TBD`, `N/A`) creep in — the easiest one to miss |
 | Quality regression | A column's missing rate climbs sharply |
+| **Distribution drift** | The type did not change but the centre moved: mean shifted by ≥1 old standard deviation, or ≥50% of its old value |
+| **Row-level diff** | Which rows exist only in the new file, which only in the old — data lost or data gained, at a glance |
+
+Two yardsticks for distribution drift, either one sufficient: **effect size**
+(the mean moved by at least one old standard deviation — scale-free, so revenue
+and percentages behave the same) and **relative change** (at least half the old
+mean — catches high-variance columns the effect-size test would wave through).
+Auto-increment keys are excluded: their mean is a row counter, not a measurement.
+
+The row diff compares **only the columns the two files share**. Otherwise an
+added column makes every row look different and the noise buries the signal.
+Each row costs one 64-bit fingerprint, capped at 500,000 per side (~30 MB); past
+that the numbers are labelled as lower bounds. Counts are of *distinct* rows,
+which is what a set comparison can honestly report.
 
 Exit codes follow the CI gate: a **breaking** change (removed column, type
 pollution, quality regression, encoding change) fails; only-added, a likely
-rename, or an `int`<->`float` widening does not. Add `--strict` to fail on any
-drift at all. `--diff --json` feeds a program instead.
+rename, an `int`<->`float` widening, a distribution shift, or lost rows do not
+(seasonality is not a bug). Add `--strict` to fail on any drift at all.
+`--no-rows` skips the extra scan on huge files. `--diff --json` feeds a program.
+
+---
+
+## Masking: act on what was found
+
+Detection without action is a report; `--mask` is the prescription. It rewrites
+the sensitive values into masks and writes a copy that is safe to share:
+
+```bash
+python dataloupe.py users.csv --mask
+# writes users.masked.csv, leaves the source untouched
+```
+
+| Kind | Original | Masked | Kept |
+|---|---|---|---|
+| Email | `zhangwei@example.com` | `z***@example.com` | the domain |
+| Phone | `13800138000` | `138****8000` | first 3, last 4 |
+| ID card | `110101199003071234` | `110101********1234` | region code, last 4 |
+| Bank card | `4111 1111 1111 1111` | `************1111` | last 4 |
+| IPv4 | `192.168.1.20` | `192.168.*.*` | first two octets |
+| URL | `https://x.com/a?token=1` | `https://x.com/***` | scheme and host |
+
+One deliberate restraint: **a bare 13-19 digit run is not treated as a card**,
+because order numbers look exactly like card numbers. It is only masked when the
+column itself was flagged, or the value is written with spaces or dashes;
+`--mask-all` overrides that. Combine with `--fix` to clean and mask in one pass.
 
 ---
 
@@ -415,13 +470,14 @@ Three things make it fast:
 python -m unittest discover -s tests -v
 ```
 
-152 tests covering encoding detection, delimiter sniffing, type inference,
+174 tests covering encoding detection, delimiter sniffing, type inference,
 statistics correctness, correlation, streaming-vs-one-shot equivalence,
-reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, exit codes, quality checks, cleaning, xlsx parsing, HTML escaping, and
+reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, exit codes, distribution drift,
+row-level diff, masking, quality checks, cleaning, xlsx parsing, HTML escaping, and
 two-file schema drift (added/removed columns, likely renames, type pollution, quality regression).
 
 ```
-Ran 152 tests in 9.6s
+Ran 174 tests in 9.2s
 
 OK
 ```

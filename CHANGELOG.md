@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.4.0
+
+Three additions that turn `--diff` into a real pipeline check, plus the ability
+to act on what the PII scan finds.
+
+**Row-level diff.** `--diff` now reports how many rows exist only in the old
+file, only in the new one, and in both. Comparison is restricted to the columns
+the two files share, so an added or dropped column cannot make every row look
+different — the noise that swamps a naive whole-row comparison. Rows are held as
+one 64-bit fingerprint each, capped at 500,000 per side, so a million-row export
+costs tens of MB rather than gigabytes; past the cap the numbers are labelled as
+lower bounds. Counts are of *distinct* rows, which is what a set comparison can
+honestly report.
+
+**Distribution drift.** A numeric column whose centre moved is a change even
+when its type did not. Two yardsticks, either sufficient: the mean moved by at
+least one old standard deviation (scale-free), or by at least half its old value
+(catches large relative moves in high-variance columns). Auto-increment keys are
+excluded — their mean is a row counter, not a measurement. Reported as drift,
+not as breaking: seasonality is not a bug, and `--strict` is the gate for teams
+that want it to fail.
+
+**`--mask` writes a redacted copy.** Detection that cannot act is a report; this
+acts. Emails keep their domain (`z***@example.com`), phones keep the last four
+(`138****8000`), ID cards keep both ends (`110101********1234`), bank cards keep
+the last four, IPv4 keeps two octets, URLs keep the host. A bare 13-19 digit run
+is only treated as a card when the column was flagged or the value is written
+with separators, because order numbers look exactly like card numbers otherwise;
+`--mask-all` overrides that. The source file is never modified.
+
+Also: `--no-rows` to skip the extra scan, `examples/orders_march.csv` /
+`orders_april.csv` to demonstrate distribution drift, and 22 new tests.
+
 ## 1.3.0
 
 PII / sensitive-information detection.

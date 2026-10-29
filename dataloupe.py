@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Iterator
 from xml.etree import ElementTree as ET
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -88,6 +88,19 @@ DEDUP_CAP = 200_000
 #: phone numbers, ID cards...). Bounded, so it costs the same on a 10-row file
 #: as on a 10-million-row one.
 PII_SAMPLE_CAP = 200
+
+#: Upper bound on distinct row fingerprints held per side when comparing the
+#: rows of two exports. Two sets of 500k 64-bit keys cost roughly 60 MB; past
+#: that the answer is reported as approximate instead of eating the machine.
+ROW_DIFF_CAP = 500_000
+
+#: A numeric column is called "shifted" when its mean moved by at least this
+#: many of the *old* standard deviations. One sigma is unambiguous movement.
+DISTRIBUTION_SHIFT_EFFECT = 1.0
+
+#: ... or when the mean moved by at least this share of its old value, which
+#: catches large relative moves in columns whose spread dwarfs their mean.
+DISTRIBUTION_SHIFT_RELATIVE = 0.5
 
 #: Column samples are drawn with a fixed seed so two runs on the same file
 #: always print the same numbers.
@@ -262,16 +275,23 @@ def looks_like_formula(text: str) -> bool:
     return False
 
 
-#: Sensitive-pattern checks. Each entry is (label, matcher); a matcher takes a
-#: single stripped cell and returns True when the value looks like that kind of
-#: secret. The label is what gets reported to the user.
+#: Sensitive-pattern checks. Named once here so detection and masking can never
+#: disagree about what counts as an email address.
+PII_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+PII_ID_CARD_RE = re.compile(r"^\d{17}[\dXx]$|^\d{15}$")
+PII_BANK_CARD_RE = re.compile(r"^(?:\d[ -]?){13,19}$")
+PII_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+PII_PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
+PII_URL_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
+
+#: Each entry is (label, matcher); the label is what gets reported to the user.
 PII_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
-    ("邮箱", re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")),
-    ("身份证号", re.compile(r"^\d{17}[\dXx]$|^\d{15}$")),
-    ("银行卡号", re.compile(r"^(?:\d[ -]?){13,19}$")),
-    ("IPv4 地址", re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")),
-    ("手机号", re.compile(r"^1[3-9]\d{9}$")),
-    ("URL", re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)),
+    ("邮箱", PII_EMAIL_RE),
+    ("身份证号", PII_ID_CARD_RE),
+    ("银行卡号", PII_BANK_CARD_RE),
+    ("IPv4 地址", PII_IPV4_RE),
+    ("手机号", PII_PHONE_RE),
+    ("URL", PII_URL_RE),
 ]
 
 
@@ -319,6 +339,134 @@ def detect_pii(sample: list[str]) -> dict[str, float]:
     n = len(sample)
     scored = {label: count / n for label, count in counts.items()}
     return {label: share for label, share in scored.items() if share >= 0.8}
+
+
+def _mask_url(text: str) -> str:
+    """Keep the scheme and host, blank out the path and query.
+
+    Tokens, session ids and tracking parameters live in the path — the host is
+    the part a reader still needs in order to understand the column.
+    """
+    match = re.match(r"^(https?://|www\.)?([^/?#]+)(.*)$", text, re.IGNORECASE)
+    if not match:
+        return "***"
+    return f"{match.group(1) or ''}{match.group(2)}/***"
+
+
+def mask_cell(text: str, *, allow_bank_card: bool = False) -> tuple[str, str] | None:
+    """Return ``(masked, label)`` when *text* looks sensitive, else ``None``.
+
+    Masking keeps the value recognisable for debugging — the last four digits of
+    a phone, the domain of an email — while destroying the part that identifies
+    a person. Every rule is a shape test, never a guess.
+
+    ``allow_bank_card`` exists because the bank-card shape (13-19 digits) also
+    matches order numbers and other long identifiers. A bare run of digits is
+    only treated as a card when the column itself was already flagged, or when
+    the value is written with separators (``4111 1111 1111 1111``).
+    """
+    cell = text.strip()
+    if not cell:
+        return None
+
+    # ID card first: an 18-digit ID card also satisfies the bank-card shape.
+    if PII_ID_CARD_RE.match(cell):
+        if len(cell) >= 10:
+            return cell[:6] + "*" * (len(cell) - 10) + cell[-4:], "身份证号"
+        return "*" * len(cell), "身份证号"
+
+    compact = cell.replace(" ", "").replace("-", "")
+    if (
+        compact.isdigit()
+        and 13 <= len(compact) <= 19
+        and _luhn_ok(compact)
+        and (allow_bank_card or " " in cell or "-" in cell)
+    ):
+        return "*" * (len(compact) - 4) + compact[-4:], "银行卡号"
+
+    if PII_EMAIL_RE.match(cell):
+        local, _, domain = cell.partition("@")
+        return f"{local[:1]}***@{domain}", "邮箱"
+
+    if PII_PHONE_RE.match(cell):
+        return cell[:3] + "****" + cell[-4:], "手机号"
+
+    if PII_IPV4_RE.match(cell):
+        parts = cell.split(".")
+        return f"{parts[0]}.{parts[1]}.*.*", "IPv4 地址"
+
+    if PII_URL_RE.match(cell):
+        return _mask_url(cell), "URL"
+
+    return None
+
+
+@dataclass
+class MaskReport:
+    """What the masking pass redacted."""
+    output: Path
+    cells_masked: int = 0
+    by_label: dict[str, int] = field(default_factory=dict)
+    rows_written: int = 0
+    cols_written: int = 0
+
+
+def mask_table(
+    header: list[str],
+    rows: list[list[str]],
+    flagged: dict[str, set[str]] | None = None,
+    *,
+    allow_all_cards: bool = False,
+) -> tuple[list[str], list[list[str]], MaskReport]:
+    """Return a copy of the table with sensitive cells redacted.
+
+    ``flagged`` maps a column name to the PII labels detection found in it.
+    It is only consulted for bank cards, where a bare 16-digit run is too
+    ambiguous to redact without column-level evidence.
+    """
+    report = MaskReport(output=Path())
+    flagged = flagged or {}
+    masked_rows: list[list[str]] = []
+
+    for row in rows:
+        new_row: list[str] = []
+        for idx, cell in enumerate(row):
+            name = header[idx] if idx < len(header) else ""
+            allow_card = allow_all_cards or "银行卡号" in flagged.get(name, set())
+            hit = mask_cell(cell, allow_bank_card=allow_card)
+            if hit is None:
+                new_row.append(cell)
+                continue
+            masked, label = hit
+            new_row.append(masked)
+            report.cells_masked += 1
+            report.by_label[label] = report.by_label.get(label, 0) + 1
+        masked_rows.append(new_row)
+
+    report.rows_written = len(masked_rows)
+    report.cols_written = len(header)
+    return header, masked_rows, report
+
+
+def render_mask_report(report: MaskReport) -> str:
+    """Human summary of a masking run."""
+    lines = [""]
+    lines.append("  " + bold("dataloupe") + dim(f"  v{__version__}") + "  " + bold("脱敏完成"))
+    lines.append("")
+    lines.append(f"  输出  {report.output}")
+    lines.append(f"  规模  {report.rows_written:,} 行 × {report.cols_written} 列")
+    lines.append(f"  脱敏  {report.cells_masked:,} 个单元格")
+    if report.by_label:
+        width = max(display_width(label) for label in report.by_label)
+        for label, count in sorted(report.by_label.items(), key=lambda kv: -kv[1]):
+            lines.append(f"    {pad(label, width)}  {count:,}")
+    lines.append("")
+    if report.cells_masked == 0:
+        lines.append("  " + dim("没有匹配到需要脱敏的内容。"))
+    else:
+        lines.append("  " + tint("✓ 已脱敏。原文件未改动。", "32"))
+    lines.append("")
+    return "\n".join(lines)
 
 
 def has_fullwidth_ascii(text: str) -> bool:
@@ -2693,6 +2841,38 @@ _NUMERIC_KINDS = frozenset({"int", "float"})
 
 
 @dataclass
+class DistributionShift:
+    """A numeric column whose centre moved between two exports."""
+    column: str
+    old_mean: float
+    new_mean: float
+    old_median: float | None
+    new_median: float | None
+    #: How many of the *old* standard deviations the mean moved by.
+    effect: float
+    #: Share of the old mean that the move represents, when the mean was non-zero.
+    relative: float | None
+
+
+@dataclass
+class RowDiff:
+    """How the row sets of two exports differ, over shared columns only.
+
+    Counts are of *distinct* rows, not raw row counts: a duplicate row adds
+    nothing to a set comparison, and saying so plainly is more honest than
+    reporting a number that mixes duplicates into the total.
+    """
+    old_only: int = 0
+    new_only: int = 0
+    common: int = 0
+    old_distinct: int = 0
+    new_distinct: int = 0
+    shared_columns: list[str] = field(default_factory=list)
+    #: False when a side hit ROW_DIFF_CAP, making the numbers a lower bound.
+    exact: bool = True
+
+
+@dataclass
 class SchemaDiff:
     old_path: str
     new_path: str
@@ -2710,6 +2890,9 @@ class SchemaDiff:
     quality_regressions: list[tuple[str, float, float]]
     drift: bool
     breaking: bool
+    #: Filled in by the caller: they need the files, not just the profiles.
+    distribution_shifts: list[DistributionShift] = field(default_factory=list)
+    row_diff: RowDiff | None = None
 
 
 def diff_profiles(old: "Profile", new: "Profile") -> SchemaDiff:
@@ -2731,11 +2914,16 @@ def diff_profiles(old: "Profile", new: "Profile") -> SchemaDiff:
     type_changes = []
     type_inconsistencies = []
     quality_regressions = []
+    distribution_shifts: list[DistributionShift] = []
     for name in shared:
         oc, nc = old_cols[name], new_cols[name]
         if oc.kind != nc.kind:
             breaking = not (oc.kind in _NUMERIC_KINDS and nc.kind in _NUMERIC_KINDS)
             type_changes.append((name, oc.kind, nc.kind, breaking))
+
+        shift = _distribution_shift(oc, nc)
+        if shift is not None:
+            distribution_shifts.append(shift)
 
         # A column can keep its inferred type yet start swallowing dirty values
         # (an "N/A" that was not a missing token, a "TBD", a stray letter). The
@@ -2764,6 +2952,7 @@ def diff_profiles(old: "Profile", new: "Profile") -> SchemaDiff:
     encoding_changed = old.encoding != new.encoding
     drift = bool(added or removed or renamed or type_changes
                  or type_inconsistencies or quality_regressions
+                 or distribution_shifts
                  or encoding_changed or old.rows != new.rows)
     breaking = bool(
         removed
@@ -2782,6 +2971,129 @@ def diff_profiles(old: "Profile", new: "Profile") -> SchemaDiff:
         type_changes=type_changes, type_inconsistencies=type_inconsistencies,
         quality_regressions=quality_regressions,
         drift=drift, breaking=breaking,
+        distribution_shifts=distribution_shifts,
+    )
+
+
+def _looks_like_sequence(col: "ColumnProfile") -> bool:
+    """True for a column that is an auto-increment key or a dense row number.
+
+    Such a column's mean is a function of how many rows exist, not of the data,
+    so reporting it as a "distribution shift" would be pure noise.
+    """
+    if col.kind != "int" or col.num_min is None or col.num_max is None:
+        return False
+    if not col.distinct_capped and col.distinct_rate < 0.99:
+        return False
+    return (col.num_max - col.num_min) >= col.total - 1
+
+
+def _distribution_shift(old: "ColumnProfile", new: "ColumnProfile") -> DistributionShift | None:
+    """Decide whether a numeric column's centre moved enough to matter.
+
+    Two yardsticks, either of which is enough:
+
+    * **effect size** — the mean moved by at least one old standard deviation.
+      Scale-free, so it works the same for revenue and for percentages.
+    * **relative change** — the mean moved by at least half its old value.
+      Catches the case where the spread dwarfs the mean, which the effect-size
+      test would wave through.
+
+    A column that is not numeric on both sides, or has no values, is skipped.
+    """
+    if old.kind not in _NUMERIC_KINDS or new.kind not in _NUMERIC_KINDS:
+        return None
+    if old.num_mean is None or new.num_mean is None:
+        return None
+    # An auto-increment key moves its mean every time rows are appended, and
+    # that says nothing about the data. Same test the quality checks use.
+    if _looks_like_sequence(old):
+        return None
+
+    delta = new.num_mean - old.num_mean
+    std = old.num_std or 0.0
+    effect = abs(delta) / std if std > 1e-12 else (0.0 if delta == 0 else math.inf)
+
+    base = abs(old.num_mean)
+    relative = delta / base if base > 1e-12 else None
+
+    moved = effect >= DISTRIBUTION_SHIFT_EFFECT
+    if relative is not None and abs(relative) >= DISTRIBUTION_SHIFT_RELATIVE:
+        moved = True
+    if not moved:
+        return None
+
+    return DistributionShift(
+        column=old.name,
+        old_mean=old.num_mean, new_mean=new.num_mean,
+        old_median=old.num_median, new_median=new.num_median,
+        effect=effect, relative=relative,
+    )
+
+
+def _row_hashes(
+    path: Path,
+    columns: list[str],
+    limit: int | None,
+    cap: int,
+) -> tuple[set[int], int, bool]:
+    """Fingerprint every row of *path* over *columns*, bounded by *cap*.
+
+    Only the named columns take part, so a schema change (an added or dropped
+    column) cannot make every row look different — which is exactly the noise
+    that would swamp a naive whole-row comparison.
+    """
+    stream, rows = iter_source(path, limit)
+    index = {name: i for i, name in enumerate(stream.header)}
+    picks = [index[name] for name in columns if name in index]
+
+    hashes: set[int] = set()
+    total = 0
+    capped = False
+    try:
+        for row in rows:
+            total += 1
+            fingerprint = hash(tuple(row[i] if i < len(row) else "" for i in picks))
+            if fingerprint in hashes:
+                continue
+            if len(hashes) < cap:
+                hashes.add(fingerprint)
+            else:
+                capped = True
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
+    return hashes, total, capped
+
+
+def compare_rows(
+    old_path: Path,
+    new_path: Path,
+    shared_columns: list[str],
+    limit: int | None = None,
+    cap: int = ROW_DIFF_CAP,
+) -> RowDiff:
+    """Compare the row *sets* of two exports over the columns they share.
+
+    This answers "did rows disappear, or did new ones show up" without holding
+    either file in memory: one 64-bit fingerprint per distinct row, capped.
+    """
+    if not shared_columns:
+        return RowDiff(shared_columns=[])
+
+    old_set, _, old_capped = _row_hashes(old_path, shared_columns, limit, cap)
+    new_set, _, new_capped = _row_hashes(new_path, shared_columns, limit, cap)
+
+    common = len(old_set & new_set)
+    return RowDiff(
+        old_only=len(old_set) - common,
+        new_only=len(new_set) - common,
+        common=common,
+        old_distinct=len(old_set),
+        new_distinct=len(new_set),
+        shared_columns=shared_columns,
+        exact=not (old_capped or new_capped),
     )
 
 
@@ -2919,6 +3231,41 @@ def render_diff_terminal(diff: SchemaDiff, strict: bool = False) -> str:
             lines.append("    ↓ " + pad(name, w) + "  " + f"{o:.1%} -> {nw:.1%}")
         lines.append("")
 
+    if diff.distribution_shifts:
+        w = max(display_width(s.column) for s in diff.distribution_shifts)
+        lines.append("  " + bold("分布漂移（数值中心明显移动）"))
+        for shift in diff.distribution_shifts:
+            # A relative move under 1% rounds to "+0%" and tells the reader
+            # nothing; the effect size is the useful number in that case.
+            if shift.relative is not None and abs(shift.relative) >= 0.01:
+                move = f"{shift.relative:+.0%}"
+            elif math.isfinite(shift.effect):
+                move = f"{shift.effect:.1f}σ"
+            else:
+                move = "∞"
+            lines.append(
+                "    ≠ " + pad(shift.column, w)
+                + "  均值 " + f"{shift.old_mean:,.2f} -> {shift.new_mean:,.2f}"
+                + "  " + tint(f"({move})", "33")
+            )
+        lines.append("")
+
+    if diff.row_diff is not None and (diff.row_diff.old_only or diff.row_diff.new_only):
+        rd = diff.row_diff
+        lines.append("  " + bold("行级差异") + dim(
+            f"  按共有的 {len(rd.shared_columns)} 列比对（不同行，非行数）"))
+        if rd.new_only:
+            lines.append("    + " + tint(f"{rd.new_only:,}", "32") + " 行只出现在新文件")
+        if rd.old_only:
+            lines.append("    - " + tint(f"{rd.old_only:,}", "31") + " 行只出现在旧文件")
+        lines.append("      " + dim(f"共有 {rd.common:,} 行"))
+        if not rd.exact:
+            # Truncating both sides can only shrink the measured intersection,
+            # so the two differences are overestimates, not underestimates.
+            lines.append("      " + dim(
+                f"只比对了前 {ROW_DIFF_CAP:,} 个不同的行，差异数是上限"))
+        lines.append("")
+
     verdict = "破坏性变更" if diff.breaking else "非破坏性变更"
     code = "31" if diff.breaking else "33"
     lines.append("  " + tint(f"结论：{verdict}。" + ("--strict 下也会失败。" if strict and not diff.breaking else ""), code))
@@ -2953,6 +3300,25 @@ def render_diff_json(diff: SchemaDiff) -> str:
             {"column": n, "old_missing_rate": round(o, 4), "new_missing_rate": round(nw, 4)}
             for (n, o, nw) in diff.quality_regressions
         ],
+        "distribution_shifts": [
+            {
+                "column": s.column,
+                "old_mean": s.old_mean, "new_mean": s.new_mean,
+                "old_median": s.old_median, "new_median": s.new_median,
+                "effect_sigma": round(s.effect, 3) if math.isfinite(s.effect) else None,
+                "relative_change": round(s.relative, 4) if s.relative is not None else None,
+            }
+            for s in diff.distribution_shifts
+        ],
+        "row_diff": None if diff.row_diff is None else {
+            "old_only": diff.row_diff.old_only,
+            "new_only": diff.row_diff.new_only,
+            "common": diff.row_diff.common,
+            "old_distinct": diff.row_diff.old_distinct,
+            "new_distinct": diff.row_diff.new_distinct,
+            "shared_columns": diff.row_diff.shared_columns,
+            "exact": diff.row_diff.exact,
+        },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -2965,6 +3331,7 @@ def build_parser() -> argparse.ArgumentParser:
                "  dataloupe data.csv -o report.html\n"
                "  dataloupe data.xlsx --json\n"
                "  dataloupe data.csv --sql postgres\n"
+               "  dataloupe users.csv --mask\n"
                "  dataloupe big.csv --limit 100000\n"
                "  dataloupe old.csv new.csv --diff",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2995,9 +3362,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-under", type=int, default=None, metavar="SCORE",
                         help="评分低于 SCORE 时以退出码 1 结束（配合 CI 用）")
     parser.add_argument("--diff", action="store_true",
-                        help="对比两个文件的结构与数据质量漂移（需两个文件）")
+                        help="对比两个文件的结构、分布与行级漂移（需两个文件）")
     parser.add_argument("--strict", action="store_true",
                         help="配合 --diff：连新增列、疑似重命名、兼容类型变更也判为失败")
+    parser.add_argument("--no-rows", action="store_true",
+                        help="配合 --diff：跳过行级差异（大文件可省一次扫描）")
+    parser.add_argument("--mask", action="store_true",
+                        help="输出脱敏副本，把邮箱/手机号/身份证号等替换成掩码"
+                             "（默认 <原名>.masked.csv）")
+    parser.add_argument("--mask-all", action="store_true",
+                        help="配合 --mask：连裸数字形式的银行卡号也脱敏（更激进）")
     parser.add_argument("--no-color", action="store_true", help="关闭颜色")
     parser.add_argument("--version", action="version", version=f"dataloupe {__version__}")
     return parser
@@ -3024,8 +3398,8 @@ def _run_diff(args: argparse.Namespace) -> int:
     if len(args.files) != 2:
         print("错误：--diff 需要两个文件（旧文件 新文件）", file=sys.stderr)
         return 2
-    if args.fix or args.sql or args.output:
-        print("错误：--diff 不支持 --fix / --sql / -o", file=sys.stderr)
+    if args.fix or args.sql or args.output or args.mask:
+        print("错误：--diff 不支持 --fix / --sql / --mask / -o", file=sys.stderr)
         return 2
 
     paths = [Path(p).expanduser() for p in args.files]
@@ -3044,6 +3418,20 @@ def _run_diff(args: argparse.Namespace) -> int:
 
     old_profile, new_profile = profiles
     diff = diff_profiles(old_profile, new_profile)
+
+    if not args.no_rows:
+        shared = [c.name for c in new_profile.columns
+                  if c.name in {o.name for o in old_profile.columns}]
+        try:
+            diff.row_diff = compare_rows(paths[0], paths[1], shared, limit=args.limit)
+            # Rows appearing is normal for an incremental export; rows that
+            # vanished from a snapshot are not. Only the second counts as drift.
+            if diff.row_diff.old_only:
+                diff.drift = True
+        except (ValueError, OSError, zipfile.BadZipFile) as exc:
+            # The row diff is an extra; failing to compute it must not take the
+            # structural answer down with it.
+            print(f"提示：行级差异计算失败（{exc}）", file=sys.stderr)
 
     if args.as_json:
         print(render_diff_json(diff))
@@ -3105,31 +3493,49 @@ def main(argv: list[str] | None = None) -> int:
 
     print(render_terminal(profile, show_preview=args.preview))
 
-    if args.fix:
+    if args.fix or args.mask:
         source = load_source(path, limit=args.limit)
-        header, rows, fix_report = clean_table(
-            source.header,
-            source.rows,
-            dedupe=args.dedupe,
-            drop_empty_cols=args.drop_empty_cols,
-            fix_headers=not args.keep_headers,
-        )
+        header, rows = source.header, source.rows
+
+        fix_report = None
+        if args.fix:
+            header, rows, fix_report = clean_table(
+                header,
+                rows,
+                dedupe=args.dedupe,
+                drop_empty_cols=args.drop_empty_cols,
+                fix_headers=not args.keep_headers,
+            )
+
+        mask_report = None
+        if args.mask:
+            flagged = {c.name: set(c.pii) for c in profile.columns if c.pii}
+            header, rows, mask_report = mask_table(
+                header, rows, flagged, allow_all_cards=args.mask_all,
+            )
+
+        suffix = ".masked.csv" if args.mask else ".cleaned.csv"
         target = (Path(args.output).expanduser() if args.output
-                  else path.with_name(f"{path.stem}.cleaned.csv"))
-        # The one promise --fix makes is that the source survives. Typing the
-        # input path into -o would quietly break it.
+                  else path.with_name(f"{path.stem}{suffix}"))
+        # The one promise these commands make is that the source survives.
+        # Typing the input path into -o would quietly break it.
         try:
             same_file = target.resolve() == path.resolve()
         except OSError:
             same_file = False
         if same_file:
             print(f"错误：输出路径和输入是同一个文件（{target}）\n"
-                  f"      --fix 不覆盖原文件，请换一个 -o 路径", file=sys.stderr)
+                  f"      不覆盖原文件，请换一个 -o 路径", file=sys.stderr)
             return 2
         if not _write_or_report(target, lambda t: write_clean_csv(t, header, rows, bom=not args.no_bom)):
             return 2
-        fix_report.output = target
-        print(render_fix_report(fix_report))
+
+        if fix_report is not None:
+            fix_report.output = target
+            print(render_fix_report(fix_report))
+        if mask_report is not None:
+            mask_report.output = target
+            print(render_mask_report(mask_report))
         return 0
 
     if args.output:

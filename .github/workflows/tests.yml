@@ -82,6 +82,54 @@ jobs:
           python dataloupe.py examples/customers_old.csv examples/customers_new.csv --diff --json | grep -q '"drift": true'
           echo "OK: diff path exercised"
 
+      - name: Row diff and distribution drift are reported
+        shell: bash
+        run: |
+          python dataloupe.py examples/customers_old.csv examples/customers_new.csv \
+            --diff --json > customers.json
+          python - <<'EOF'
+          import json
+          payload = json.load(open("customers.json", encoding="utf-8"))
+          rows = payload["row_diff"]
+          assert rows["old_only"] == 2, rows
+          assert rows["new_only"] == 2, rows
+          assert rows["common"] == 3, rows
+          print("OK: row diff", rows)
+          EOF
+
+          python dataloupe.py examples/orders_march.csv examples/orders_april.csv \
+            --diff --json > orders.json
+          python - <<'EOF'
+          import json
+          payload = json.load(open("orders.json", encoding="utf-8"))
+          shifted = {s["column"] for s in payload["distribution_shifts"]}
+          assert "amount" in shifted, shifted
+          assert "shipping_days" in shifted, shifted
+          # An auto-increment key must never be reported as a shift.
+          assert "order_id" not in shifted, shifted
+          print("OK: distribution drift", sorted(shifted))
+          EOF
+
+      - name: Masking redacts and leaves the source alone
+        shell: bash
+        run: |
+          cp examples/users.csv users_copy.csv
+          before=$(cksum users_copy.csv)
+          python dataloupe.py users_copy.csv --mask -o masked.csv --no-color > /dev/null
+          after=$(cksum users_copy.csv)
+          if [ "$before" != "$after" ]; then
+            echo "::error::--mask modified its input"
+            exit 1
+          fi
+          grep -q 'z\*\*\*@example.com' masked.csv
+          grep -q '138\*\*\*\*8000' masked.csv
+          grep -q '110101\*\*\*\*\*\*\*\*1234' masked.csv
+          if grep -q 'zhangwei@example.com' masked.csv; then
+            echo "::error::original email survived masking"
+            exit 1
+          fi
+          echo "OK: masked output is clean"
+
       - name: Survives a legacy Windows code page
         if: runner.os == 'Windows'
         shell: bash

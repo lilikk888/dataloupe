@@ -1183,5 +1183,221 @@ class TestDiff(unittest.TestCase):
         self.assertEqual(dl._edit_distance("", "ab"), 2)
 
 
+class TestDistributionShift(unittest.TestCase):
+    """A column whose centre moved is a change even when its type did not."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def _diff(self, old_body: str, new_body: str, header: str = "amount"):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text(f"{header}\n{old_body}", encoding="utf-8")
+        new.write_text(f"{header}\n{new_body}", encoding="utf-8")
+        return dl.diff_profiles(dl.analyse(old), dl.analyse(new))
+
+    def test_a_large_mean_move_is_reported(self):
+        # Deliberately non-consecutive: a run of 40 consecutive integers is an
+        # auto-increment key, which the sequence guard skips.
+        old = "".join(f"{100 + i % 7}\n" for i in range(40))
+        new = "".join(f"{400 + i % 7}\n" for i in range(40))
+        diff = self._diff(old, new)
+        shifts = {s.column: s for s in diff.distribution_shifts}
+        self.assertIn("amount", shifts)
+        self.assertGreater(shifts["amount"].relative, 2.0)
+        self.assertTrue(diff.drift)
+
+    def test_a_stable_column_is_not_reported(self):
+        old = "".join(f"{100 + i % 5}\n" for i in range(40))
+        new = "".join(f"{100 + i % 5}\n" for i in range(40))
+        diff = self._diff(old, new)
+        self.assertEqual(diff.distribution_shifts, [])
+        self.assertFalse(diff.drift)
+
+    def test_an_auto_increment_column_is_ignored(self):
+        # Same shape, ids shifted by 1000: the mean moves by many sigmas, but
+        # an id column's mean is a row counter, not a measurement.
+        old = "".join(f"{i}\n" for i in range(50))
+        new = "".join(f"{i + 1000}\n" for i in range(50))
+        diff = self._diff(old, new, header="order_id")
+        self.assertEqual(diff.distribution_shifts, [])
+
+    def test_a_distribution_shift_is_not_breaking(self):
+        old = "".join(f"{100 + i % 7}\n" for i in range(40))
+        new = "".join(f"{400 + i % 7}\n" for i in range(40))
+        diff = self._diff(old, new)
+        self.assertTrue(diff.drift)
+        self.assertFalse(diff.breaking)
+
+    def test_json_carries_the_shift(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("amount\n" + "".join(f"{100 + i % 7}\n" for i in range(40)), encoding="utf-8")
+        new.write_text("amount\n" + "".join(f"{400 + i % 7}\n" for i in range(40)), encoding="utf-8")
+        diff = dl.diff_profiles(dl.analyse(old), dl.analyse(new))
+        payload = json.loads(dl.render_diff_json(diff))
+        self.assertEqual(payload["distribution_shifts"][0]["column"], "amount")
+
+
+class TestRowDiff(unittest.TestCase):
+    """Row-level comparison answers "did rows disappear" without holding the
+    files in memory."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def test_overlap_and_disappearance(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("id,v\n1,a\n2,b\n3,c\n", encoding="utf-8")
+        new.write_text("id,v\n2,b\n3,c\n4,d\n", encoding="utf-8")
+        diff = dl.compare_rows(old, new, ["id", "v"])
+        self.assertEqual(diff.common, 2)
+        self.assertEqual(diff.old_only, 1)
+        self.assertEqual(diff.new_only, 1)
+        self.assertTrue(diff.exact)
+
+    def test_identical_files_have_no_difference(self):
+        path = self.directory / "same.csv"
+        path.write_text("id,v\n1,a\n2,b\n", encoding="utf-8")
+        diff = dl.compare_rows(path, path, ["id", "v"])
+        self.assertEqual((diff.old_only, diff.new_only, diff.common), (0, 0, 2))
+
+    def test_only_shared_columns_take_part(self):
+        # The new file gained a column; comparing whole rows would call every
+        # row different. Comparing on the shared columns must not.
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("id,v\n1,a\n2,b\n", encoding="utf-8")
+        new.write_text("id,v,extra\n1,a,x\n2,b,y\n", encoding="utf-8")
+        diff = dl.compare_rows(old, new, ["id", "v"])
+        self.assertEqual(diff.common, 2)
+        self.assertEqual(diff.old_only, 0)
+        self.assertEqual(diff.new_only, 0)
+
+    def test_duplicate_rows_collapse_to_one_distinct_row(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("id\n1\n1\n1\n", encoding="utf-8")
+        new.write_text("id\n1\n", encoding="utf-8")
+        diff = dl.compare_rows(old, new, ["id"])
+        self.assertEqual(diff.common, 1)
+        self.assertEqual(diff.old_only, 0)
+
+    def test_lost_rows_count_as_drift(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("id,v\n1,a\n2,b\n3,c\n", encoding="utf-8")
+        new.write_text("id,v\n1,a\n", encoding="utf-8")
+        # Data loss is drift, not a schema break: a rolling-window export drops
+        # rows by design, so only --strict turns it into a build failure.
+        self.assertEqual(dl.main([str(old), str(new), "--diff", "--no-color"]), 0)
+        self.assertEqual(dl.main([str(old), str(new), "--diff", "--no-color", "--strict"]), 1)
+
+    def test_no_rows_skips_the_comparison(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("id\n1\n", encoding="utf-8")
+        new.write_text("id\n1\n2\n", encoding="utf-8")
+        self.assertEqual(dl.main([str(old), str(new), "--diff", "--no-color", "--no-rows"]), 0)
+
+
+class TestMask(unittest.TestCase):
+    """Masking has to destroy the identifier while leaving the value readable."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def test_email_keeps_the_domain(self):
+        masked, label = dl.mask_cell("zhangwei@example.com")
+        self.assertEqual(label, "邮箱")
+        self.assertEqual(masked, "z***@example.com")
+
+    def test_phone_keeps_the_last_four(self):
+        masked, label = dl.mask_cell("13800138000")
+        self.assertEqual(label, "手机号")
+        self.assertEqual(masked, "138****8000")
+
+    def test_id_card_keeps_the_ends(self):
+        masked, label = dl.mask_cell("110101199003071234")
+        self.assertEqual(label, "身份证号")
+        self.assertEqual(masked, "110101********1234")
+
+    def test_bank_card_with_separators_is_masked(self):
+        masked, label = dl.mask_cell("4111 1111 1111 1111")
+        self.assertEqual(label, "银行卡号")
+        self.assertEqual(masked, "************1111")
+
+    def test_bare_digits_are_not_a_card_by_default(self):
+        # A 16-digit order number must survive unless the column was flagged.
+        self.assertIsNone(dl.mask_cell("4111111111111111"))
+        self.assertIsNotNone(dl.mask_cell("4111111111111111", allow_bank_card=True))
+
+    def test_ordinary_values_pass_through(self):
+        for value in ("张伟", "42", "2024-01-05", "", "hello world"):
+            self.assertIsNone(dl.mask_cell(value), value)
+
+    def test_masked_output_no_longer_looks_sensitive(self):
+        # The whole point: a masked file must not itself trip the detector.
+        path = self.directory / "pii.csv"
+        path.write_text(
+            "email,phone\n"
+            + "".join(f"user{i}@example.com,138{i:08d}\n" for i in range(12)),
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        flagged = {c.name: set(c.pii) for c in profile.columns if c.pii}
+        source = dl.load_source(path)
+        _, rows, report = dl.mask_table(source.header, source.rows, flagged)
+        self.assertEqual(report.cells_masked, 24)
+        self.assertEqual(dl.detect_pii([r[0] for r in rows]), {})
+        self.assertEqual(dl.detect_pii([r[1] for r in rows]), {})
+
+    def test_cli_writes_a_masked_copy_and_keeps_the_source(self):
+        path = self.directory / "pii.csv"
+        path.write_text(
+            "email\n" + "".join(f"user{i}@example.com\n" for i in range(12)),
+            encoding="utf-8",
+        )
+        before = path.read_text(encoding="utf-8")
+        target = self.directory / "masked.csv"
+        self.assertEqual(dl.main([str(path), "--mask", "-o", str(target), "--no-color"]), 0)
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        written = target.read_text(encoding="utf-8-sig")
+        self.assertIn("u***@example.com", written)
+        self.assertNotIn("user0@example.com", written)
+
+    def test_default_output_name(self):
+        path = self.directory / "people.csv"
+        path.write_text(
+            "email\n" + "".join(f"user{i}@example.com\n" for i in range(12)),
+            encoding="utf-8",
+        )
+        self.assertEqual(dl.main([str(path), "--mask", "--no-color"]), 0)
+        self.assertTrue((self.directory / "people.masked.csv").exists())
+
+    def test_refuses_to_overwrite_the_source(self):
+        path = self.directory / "people.csv"
+        path.write_text("email\n" + "".join(f"u{i}@x.com\n" for i in range(12)), encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+        self.assertEqual(dl.main([str(path), "--mask", "-o", str(path), "--no-color"]), 2)
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_mask_all_catches_bare_card_numbers(self):
+        path = self.directory / "cards.csv"
+        path.write_text(
+            "card\n" + "4111111111111111\n" * 12,
+            encoding="utf-8",
+        )
+        target = self.directory / "out.csv"
+        self.assertEqual(
+            dl.main([str(path), "--mask", "--mask-all", "-o", str(target), "--no-color"]), 0
+        )
+        self.assertIn("************1111", target.read_text(encoding="utf-8-sig"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
