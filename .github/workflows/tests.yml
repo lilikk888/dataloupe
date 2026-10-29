@@ -85,8 +85,14 @@ jobs:
       - name: Row diff and distribution drift are reported
         shell: bash
         run: |
+          # This pair carries deliberate breaking drift, so --diff exits 1 by
+          # design. set +e is scoped to the command and restored immediately,
+          # so a failed assertion below still fails the step.
+          set +e
           python dataloupe.py examples/customers_old.csv examples/customers_new.csv \
             --diff --json > customers.json
+          set -e
+
           python - <<'EOF'
           import json
           payload = json.load(open("customers.json", encoding="utf-8"))
@@ -99,6 +105,7 @@ jobs:
 
           python dataloupe.py examples/orders_march.csv examples/orders_april.csv \
             --diff --json > orders.json
+
           python - <<'EOF'
           import json
           payload = json.load(open("orders.json", encoding="utf-8"))
