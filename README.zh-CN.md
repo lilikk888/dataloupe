@@ -212,6 +212,9 @@ CREATE TABLE sales (
 
 ```bash
 python dataloupe.py last_week.csv today.csv --diff
+
+# 出一份可分享的 HTML 漂移报告
+python dataloupe.py last_week.csv today.csv --diff -o drift.html
 ```
 
 ```text
@@ -452,12 +455,12 @@ for row in rows:              # 一次只持有一行
 python -m unittest discover -s tests -v
 ```
 
-174 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
-流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、退出码与 CI 门禁、分布漂移、行级差异、脱敏、质量检测、数据清洗、
+178 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
+流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、退出码与 CI 门禁、分布漂移、行级差异、脱敏、漂移 HTML 报告、质量检测、数据清洗、
 xlsx 解析、HTML 转义、CLI 退出码、两文件 schema 漂移对比（增删列、疑似重命名、类型污染、质量退化）。
 
 ```
-Ran 174 tests in 9.2s
+Ran 178 tests in 8.8s
 
 OK
 ```

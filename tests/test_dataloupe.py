@@ -1304,6 +1304,63 @@ class TestRowDiff(unittest.TestCase):
         self.assertEqual(dl.main([str(old), str(new), "--diff", "--no-color", "--no-rows"]), 0)
 
 
+class TestDiffHtml(unittest.TestCase):
+    """The drift report has to be shareable, not just printable."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def test_writes_a_self_contained_report(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("a,b\n1,x\n2,y\n3,z\n", encoding="utf-8")
+        new.write_text("a,b,c\n1,x,q\n2,y,r\n", encoding="utf-8")
+        target = self.directory / "drift.html"
+        # Only an added column: that is drift, not a break, so exit 0.
+        self.assertEqual(
+            dl.main([str(old), str(new), "--diff", "-o", str(target), "--no-color"]), 0
+        )
+        html = target.read_text(encoding="utf-8")
+        self.assertIn("<!DOCTYPE html>", html)
+        self.assertIn("新增列", html)
+        # No external resources: the report has to open offline.
+        self.assertNotRegex(html, r'(?:src|href)="https?://')
+
+    def test_removed_column_is_breaking(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("a,b\n1,x\n", encoding="utf-8")
+        new.write_text("a\n1\n", encoding="utf-8")
+        target = self.directory / "drift.html"
+        self.assertEqual(
+            dl.main([str(old), str(new), "--diff", "-o", str(target), "--no-color"]), 1
+        )
+        self.assertIn("删除列", target.read_text(encoding="utf-8"))
+
+    def test_distribution_shift_gets_bars(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("amount\n" + "".join(f"{100 + i % 7}\n" for i in range(40)), encoding="utf-8")
+        new.write_text("amount\n" + "".join(f"{400 + i % 7}\n" for i in range(40)), encoding="utf-8")
+        target = self.directory / "drift.html"
+        dl.main([str(old), str(new), "--diff", "-o", str(target), "--no-color"])
+        html = target.read_text(encoding="utf-8")
+        self.assertIn("分布漂移", html)
+        self.assertIn('class="fill new"', html)
+
+    def test_escapes_column_names(self):
+        old = self.directory / "old.csv"
+        new = self.directory / "new.csv"
+        old.write_text("a\n1\n", encoding="utf-8")
+        new.write_text("a,<script>\n1,x\n", encoding="utf-8")
+        target = self.directory / "drift.html"
+        dl.main([str(old), str(new), "--diff", "-o", str(target), "--no-color"])
+        html = target.read_text(encoding="utf-8")
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+
 class TestMask(unittest.TestCase):
     """Masking has to destroy the identifier while leaving the value readable."""
 

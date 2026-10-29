@@ -2321,6 +2321,40 @@ footer{margin-top:48px;padding-top:20px;border-top:1px solid var(--line);color:v
 .corr .arrow{color:var(--muted);font-size:11px;flex-shrink:0}
 .corr .r{margin-left:auto;font-weight:600;flex-shrink:0}
 .corr .r.bad{color:var(--bad)} .corr .r.warn{color:var(--warn)} .corr .r.ok{color:var(--muted)}
+.verdict{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:20px;
+  font-size:13px;font-weight:600;border:1px solid}
+.verdict.breaking{background:#fde2e1;color:#b42318;border-color:#f6b8b3}
+.verdict.drift{background:#fdf3e0;color:#96590b;border-color:#f3d9a8}
+.verdict.clean{background:#e5f6ea;color:#15803d;border-color:#b7e4c3}
+.facts{display:flex;flex-wrap:wrap;gap:26px;margin:18px 0 4px;
+  font-family:ui-monospace,Consolas,monospace;font-size:13px}
+.facts div{color:var(--muted)}
+.facts b{color:var(--ink);font-weight:600}
+.sec{margin-top:26px}
+.sec h3{font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--muted);margin:0 0 10px}
+.rows{display:grid;gap:6px}
+.row{background:var(--card);border:1px solid var(--line);border-radius:9px;
+  padding:9px 14px;display:flex;align-items:center;gap:12px;font-size:13px;
+  font-family:ui-monospace,Consolas,monospace}
+.row .mark{font-weight:700;width:14px;text-align:center;flex-shrink:0}
+.row .mark.add{color:var(--ok)} .row .mark.del{color:var(--bad)}
+.row .mark.ren{color:var(--muted)} .row .mark.bad{color:var(--bad)}
+.row .name{font-weight:600}
+.row .why{margin-left:auto;color:var(--muted);font-size:12.5px;text-align:right}
+.shift{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:11px 14px}
+.shift-top{display:flex;align-items:baseline;gap:10px;font-size:13px;
+  font-family:ui-monospace,Consolas,monospace}
+.shift-top .name{font-weight:600}
+.shift-top .move{margin-left:auto;font-weight:600;color:var(--warn)}
+.bars{margin-top:9px;display:grid;gap:5px}
+.barline{display:flex;align-items:center;gap:9px;font-size:11.5px;
+  font-family:ui-monospace,Consolas,monospace;color:var(--muted)}
+.barline .track{flex:1;height:8px;background:var(--chip);border-radius:5px;overflow:hidden}
+.barline .fill{height:100%;border-radius:5px}
+.barline .fill.old{background:var(--muted);opacity:.45}
+.barline .fill.new{background:var(--warn)}
+.barline .val{width:96px;text-align:right;flex-shrink:0;color:var(--ink)}
 """
 
 HTML_JS = """
@@ -3322,6 +3356,162 @@ def render_diff_json(diff: SchemaDiff) -> str:
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
+
+def render_diff_html(diff: SchemaDiff) -> str:
+    """A shareable HTML version of the drift report.
+
+    Same shell as the profile report, but the content is a list of changes
+    rather than a list of columns — the reader wants to know what moved, not
+    what the data looks like.
+    """
+    old_name = Path(diff.old_path).name
+    new_name = Path(diff.new_path).name
+
+    if diff.breaking:
+        verdict, verdict_cls = "破坏性变更", "breaking"
+    elif diff.drift:
+        verdict, verdict_cls = "检测到漂移", "drift"
+    else:
+        verdict, verdict_cls = "未发现漂移", "clean"
+
+    delta = diff.new_rows - diff.old_rows
+    sign = "+" if delta >= 0 else ""
+    facts = [
+        f'<div>行数 <b>{diff.old_rows:,} → {diff.new_rows:,}</b> ({sign}{delta:,})</div>',
+        f'<div>列数 <b>{diff.old_cols} → {diff.new_cols}</b></div>',
+    ]
+    if diff.old_encoding != diff.new_encoding:
+        facts.append(
+            f'<div>编码 <b>{_esc(diff.old_encoding)} → {_esc(diff.new_encoding)}</b></div>')
+
+    sections: list[str] = []
+
+    def add_section(title: str, body: str) -> None:
+        sections.append(
+            f'<div class="sec"><h3>{title}</h3><div class="rows">{body}</div></div>')
+
+    def simple_rows(mark: str, mark_cls: str, names: list[str], why: str) -> str:
+        return "".join(
+            f'<div class="row"><span class="mark {mark_cls}">{mark}</span>'
+            f'<span class="name">{_esc(n)}</span>'
+            f'<span class="why">{_esc(why)}</span></div>'
+            for n in names
+        )
+
+    if diff.added:
+        add_section("新增列", simple_rows("+", "add", diff.added, "确认来源"))
+
+    if diff.removed:
+        add_section("删除列", simple_rows("-", "del", diff.removed, "下游按名取值会报错"))
+
+    if diff.renamed:
+        add_section("疑似重命名", "".join(
+            f'<div class="row"><span class="mark ren">~</span>'
+            f'<span class="name">{_esc(o)} → {_esc(n)}</span>'
+            f'<span class="why">类型一致，名称相近</span></div>'
+            for o, n in diff.renamed))
+
+    breaking_changes = [(n, o, nw) for (n, o, nw, b) in diff.type_changes if b]
+    benign_changes = [(n, o, nw) for (n, o, nw, b) in diff.type_changes if not b]
+    if breaking_changes:
+        add_section("类型变更 · 破坏性", "".join(
+            f'<div class="row"><span class="mark bad">!</span>'
+            f'<span class="name">{_esc(n)}</span>'
+            f'<span class="why">{_esc(o)} → {_esc(nw)}</span></div>'
+            for n, o, nw in breaking_changes))
+    if benign_changes:
+        add_section("类型变更 · 兼容", "".join(
+            f'<div class="row"><span class="mark ren">~</span>'
+            f'<span class="name">{_esc(n)}</span>'
+            f'<span class="why">{_esc(o)} → {_esc(nw)}</span></div>'
+            for n, o, nw in benign_changes))
+
+    if diff.type_inconsistencies:
+        add_section("类型污染", "".join(
+            f'<div class="row"><span class="mark bad">!</span>'
+            f'<span class="name">{_esc(n)}</span>'
+            f'<span class="why">{o:.1%} → {nw:.1%} 无法解析</span></div>'
+            for n, o, nw in diff.type_inconsistencies))
+
+    if diff.quality_regressions:
+        add_section("质量退化", "".join(
+            f'<div class="row"><span class="mark bad">↓</span>'
+            f'<span class="name">{_esc(n)}</span>'
+            f'<span class="why">缺失 {o:.1%} → {nw:.1%}</span></div>'
+            for n, o, nw in diff.quality_regressions))
+
+    if diff.distribution_shifts:
+        blocks = []
+        for shift in diff.distribution_shifts:
+            if shift.relative is not None and abs(shift.relative) >= 0.01:
+                move = f"{shift.relative:+.0%}"
+            elif math.isfinite(shift.effect):
+                move = f"{shift.effect:.1f}σ"
+            else:
+                move = "∞"
+            peak = max(abs(shift.old_mean), abs(shift.new_mean)) or 1.0
+            old_w = abs(shift.old_mean) / peak * 100
+            new_w = abs(shift.new_mean) / peak * 100
+            blocks.append(
+                f'<div class="shift"><div class="shift-top">'
+                f'<span class="name">{_esc(shift.column)}</span>'
+                f'<span class="move">{move}</span></div>'
+                f'<div class="bars">'
+                f'<div class="barline"><span class="val">{shift.old_mean:,.2f}</span>'
+                f'<span class="track"><span class="fill old" style="width:{old_w:.1f}%"></span></span></div>'
+                f'<div class="barline"><span class="val">{shift.new_mean:,.2f}</span>'
+                f'<span class="track"><span class="fill new" style="width:{new_w:.1f}%"></span></span></div>'
+                f'</div></div>'
+            )
+        add_section("分布漂移（均值）", "".join(blocks))
+
+    if diff.row_diff is not None and (diff.row_diff.old_only or diff.row_diff.new_only):
+        rd = diff.row_diff
+        body = (
+            f'<div class="row"><span class="mark add">+</span>'
+            f'<span class="name">{rd.new_only:,} 行</span>'
+            f'<span class="why">只出现在新文件</span></div>'
+            f'<div class="row"><span class="mark del">-</span>'
+            f'<span class="name">{rd.old_only:,} 行</span>'
+            f'<span class="why">只出现在旧文件</span></div>'
+            f'<div class="row"><span class="mark ren">=</span>'
+            f'<span class="name">{rd.common:,} 行</span>'
+            f'<span class="why">两边都有</span></div>'
+        )
+        add_section(f"行级差异 · 按共有的 {len(rd.shared_columns)} 列比对", body)
+
+    body_html = "".join(sections) if sections else (
+        '<p class="empty-note">两份文件没有差异。</p>')
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>dataloupe · 漂移对比 · {_esc(new_name)}</title>
+<style>{HTML_CSS}</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div>
+    <div class="brand">dataloupe · 漂移对比</div>
+    <h1>{_esc(new_name)}</h1>
+    <div class="meta">{_esc(old_name)} → {_esc(new_name)}</div>
+  </div>
+  <div><span class="verdict {verdict_cls}">{verdict}</span></div>
+</header>
+<div class="facts">{"".join(facts)}</div>
+{body_html}
+<footer>
+  <span>dataloupe v{__version__} · 零依赖数据体检</span>
+  <span>{_esc(diff.new_path)}</span>
+</footer>
+</div>
+</body>
+</html>"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dataloupe",
@@ -3338,7 +3528,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("files", nargs="+", help="要分析的文件；配合 --diff 时给两个（旧文件 新文件）")
     parser.add_argument("-o", "--output", metavar="PATH",
-                        help="HTML 报告路径；配合 --fix 时是清洗后的数据路径")
+                        help="HTML 报告路径；配合 --diff 时是漂移报告，"
+                             "配合 --fix / --mask 时是输出数据路径")
     parser.add_argument("--fix", action="store_true",
                         help="清洗数据并写出新文件（默认 <原名>.cleaned.csv）")
     parser.add_argument("--dedupe", action="store_true",
@@ -3398,8 +3589,8 @@ def _run_diff(args: argparse.Namespace) -> int:
     if len(args.files) != 2:
         print("错误：--diff 需要两个文件（旧文件 新文件）", file=sys.stderr)
         return 2
-    if args.fix or args.sql or args.output or args.mask:
-        print("错误：--diff 不支持 --fix / --sql / --mask / -o", file=sys.stderr)
+    if args.fix or args.sql or args.mask:
+        print("错误：--diff 不支持 --fix / --sql / --mask", file=sys.stderr)
         return 2
 
     paths = [Path(p).expanduser() for p in args.files]
@@ -3433,9 +3624,17 @@ def _run_diff(args: argparse.Namespace) -> int:
             # structural answer down with it.
             print(f"提示：行级差异计算失败（{exc}）", file=sys.stderr)
 
+    if args.output:
+        target = Path(args.output).expanduser()
+        if not _write_or_report(
+            target, lambda t: t.write_text(render_diff_html(diff), encoding="utf-8")
+        ):
+            return 2
+        print(f"  HTML 漂移报告已写入 {target}\n")
+
     if args.as_json:
         print(render_diff_json(diff))
-    else:
+    elif not args.output:
         print(render_diff_terminal(diff, strict=args.strict))
 
     # A breaking change fails the build by default; --strict also fails on any

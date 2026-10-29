@@ -214,6 +214,9 @@ downstream code either crashes or, worse, **silently computes the wrong answer**
 
 ```bash
 python dataloupe.py last_week.csv today.csv --diff
+
+# ... or write a shareable HTML drift report
+python dataloupe.py last_week.csv today.csv --diff -o drift.html
 ```
 
 ```text
@@ -470,14 +473,14 @@ Three things make it fast:
 python -m unittest discover -s tests -v
 ```
 
-174 tests covering encoding detection, delimiter sniffing, type inference,
+178 tests covering encoding detection, delimiter sniffing, type inference,
 statistics correctness, correlation, streaming-vs-one-shot equivalence,
 reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, exit codes, distribution drift,
-row-level diff, masking, quality checks, cleaning, xlsx parsing, HTML escaping, and
+row-level diff, masking, HTML drift reports, quality checks, cleaning, xlsx parsing, HTML escaping, and
 two-file schema drift (added/removed columns, likely renames, type pollution, quality regression).
 
 ```
-Ran 174 tests in 9.2s
+Ran 178 tests in 8.8s
 
 OK
 ```

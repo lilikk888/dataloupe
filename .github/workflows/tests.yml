@@ -110,6 +110,21 @@ jobs:
           print("OK: distribution drift", sorted(shifted))
           EOF
 
+      - name: Drift report is a self-contained HTML file
+        shell: bash
+        run: |
+          set +e
+          python dataloupe.py examples/orders_march.csv examples/orders_april.csv \
+            --diff -o drift.html --no-color
+          set -e
+          test -s drift.html
+          grep -q "分布漂移" drift.html
+          if grep -qE '(src|href)="https?://' drift.html; then
+            echo "::error::drift report references external resources"
+            exit 1
+          fi
+          echo "OK: drift.html is standalone"
+
       - name: Masking redacts and leaves the source alone
         shell: bash
         run: |
