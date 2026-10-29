@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Iterator
 from xml.etree import ElementTree as ET
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -92,6 +92,10 @@ PII_SAMPLE_CAP = 200
 #: How many offending values to keep per column. Enough to show the reader what
 #: to go fix, few enough to stay readable in a terminal line.
 BAD_SAMPLE_CAP = 3
+
+#: Largest integer a float64 represents exactly. Past this, an 18-digit ID
+#: number stored as a number has already lost its last digits.
+FLOAT_EXACT_INT = 2 ** 53
 
 #: Upper bound on distinct row fingerprints held per side when comparing the
 #: rows of two exports. Two sets of 500k 64-bit keys cost roughly 60 MB; past
@@ -288,6 +292,18 @@ PII_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 PII_PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
 PII_URL_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
 
+#: 统一社会信用代码 (GB 32100-2015). 18 characters, but the alphabet omits
+#: I, O, S, V and Z to avoid confusion with digits, and the first character is
+#: the registering authority (1 编制 / 5 民政 / 9 工商 / Y 其他).
+PII_USCC_RE = re.compile(r"^[159Y][1239][0-9A-HJ-NPQRTUWXY]{16}$")
+
+#: 车牌号. A province character, a city letter (I and O are not issued), then
+#: five alphanumerics — six for new-energy plates, which end in D/F.
+PII_PLATE_RE = re.compile(
+    r"^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领]"
+    r"[A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,5}[A-HJ-NP-Z0-9挂学警港澳]$"
+)
+
 #: Each entry is (label, matcher); the label is what gets reported to the user.
 PII_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
     ("邮箱", PII_EMAIL_RE),
@@ -296,7 +312,92 @@ PII_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
     ("IPv4 地址", PII_IPV4_RE),
     ("手机号", PII_PHONE_RE),
     ("URL", PII_URL_RE),
+    ("统一社会信用代码", PII_USCC_RE),
+    ("车牌号", PII_PLATE_RE),
 ]
+
+#: Weights for the GB 11643 ID-card check digit, and what a remainder maps to.
+_ID_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+_ID_CHECK = "10X98765432"
+
+#: Alphabet and weights for the 统一社会信用代码 check digit (mod 31).
+_USCC_ALPHABET = "0123456789ABCDEFGHJKLMNPQRTUWXY"
+_USCC_WEIGHTS = (1, 3, 9, 27, 19, 26, 16, 17, 20, 29, 25, 13, 8, 24, 10, 30, 28)
+
+#: Weights for the 9-character 组织机构代码 check digit (mod 11).
+_ORG_WEIGHTS = (3, 7, 9, 10, 5, 8, 4, 2)
+
+
+def id_card_checksum_ok(text: str) -> bool | None:
+    """Validate the GB 11643 check digit.
+
+    Returns ``None`` for the 15-digit legacy format, which carries no check
+    digit — "unknown" is not the same as "wrong".
+    """
+    if len(text) == 15:
+        return None
+    if len(text) != 18:
+        return False
+    total = 0
+    for ch, weight in zip(text[:17], _ID_WEIGHTS):
+        if not ch.isdigit():
+            return False
+        total += int(ch) * weight
+    return _ID_CHECK[total % 11] == text[17].upper()
+
+
+def uscc_checksum_ok(text: str) -> bool:
+    """Validate the GB 32100-2015 check digit (mod 31)."""
+    if len(text) != 18:
+        return False
+    total = 0
+    for ch, weight in zip(text[:17], _USCC_WEIGHTS):
+        position = _USCC_ALPHABET.find(ch.upper())
+        if position < 0:
+            return False
+        total += position * weight
+    remainder = 31 - total % 31
+    if remainder == 31:
+        remainder = 0
+    return _USCC_ALPHABET[remainder] == text[17].upper()
+
+
+def org_code_checksum_ok(text: str) -> bool:
+    """Validate the 9-character 组织机构代码 check digit (mod 11)."""
+    if len(text) != 9 or not text[:8].isdigit():
+        return False
+    total = sum(int(ch) * weight for ch, weight in zip(text[:8], _ORG_WEIGHTS))
+    remainder = 11 - total % 11
+    expected = "0" if remainder == 11 else ("X" if remainder == 10 else str(remainder))
+    return text[8].upper() == expected
+
+
+def checksum_failures(sample: list[str]) -> dict[str, tuple[int, int]]:
+    """Count values that look like an ID but fail its check digit.
+
+    Returns ``{label: (checked, failed)}``. This is a data-quality signal, not
+    a privacy one: an ID card whose check digit is wrong was mistyped or
+    invented, and either way the row is wrong.
+    """
+    checked: dict[str, int] = {}
+    failed: dict[str, int] = {}
+
+    for cell in sample:
+        text = cell.strip()
+        if not text:
+            continue
+        if PII_ID_CARD_RE.match(text):
+            verdict = id_card_checksum_ok(text)
+            if verdict is not None:
+                checked["身份证号"] = checked.get("身份证号", 0) + 1
+                if not verdict:
+                    failed["身份证号"] = failed.get("身份证号", 0) + 1
+        elif PII_USCC_RE.match(text):
+            checked["统一社会信用代码"] = checked.get("统一社会信用代码", 0) + 1
+            if not uscc_checksum_ok(text):
+                failed["统一社会信用代码"] = failed.get("统一社会信用代码", 0) + 1
+
+    return {label: (total, failed.get(label, 0)) for label, total in checked.items()}
 
 
 def _luhn_ok(digits: str) -> bool:
@@ -401,6 +502,15 @@ def mask_cell(text: str, *, allow_bank_card: bool = False) -> tuple[str, str] | 
 
     if PII_URL_RE.match(cell):
         return _mask_url(cell), "URL"
+
+    if PII_USCC_RE.match(cell):
+        # Keep the registering-authority prefix and the tail: enough to tell
+        # two companies apart without naming either.
+        return cell[:4] + "*" * 10 + cell[-4:], "统一社会信用代码"
+
+    if PII_PLATE_RE.match(cell):
+        # Province + city stay; the plate number itself goes.
+        return cell[:2] + "*" * (len(cell) - 3) + cell[-1], "车牌号"
 
     return None
 
@@ -1767,6 +1877,20 @@ def find_issues(profile: Profile) -> list[Issue]:
                 suggestion="确认该列是否含有 PII/密钥；在分享或入库前先做脱敏",
             ))
 
+        # A check digit that does not add up is a *different* problem from a
+        # privacy one: the row is wrong, not exposed. Chinese ID numbers and
+        # credit codes both carry one, so a typo is detectable.
+        for name, (checked, bad) in checksum_failures(col.value_sample_raw).items():
+            if not bad:
+                continue
+            share = bad / max(checked, 1)
+            issues.append(Issue(
+                "medium", "证件号校验位不通过",
+                f"「{label}」{checked} 个{name}里有 {bad} 个算不对校验位（{share:.0%}）",
+                column=col.name,
+                suggestion="校验位错说明号码是编的或录入错了，不是真实证件号",
+            ))
+
         if col.kind == "empty" and col.total:
             issues.append(Issue("high", "整列为空", f"「{label}」没有任何数据", column=col.name,
                                 suggestion="确认这列是否应该存在"))
@@ -1868,6 +1992,21 @@ def find_issues(profile: Profile) -> list[Issue]:
                 issues.append(Issue("low", "存在离群值",
                                     f"「{label}」有 {col.num_outliers} 个值落在 1.5×IQR 之外（{rate:.1%}）",
                                     column=col.name, suggestion="先确认是录入错误还是真实极值，再决定是否剔除"))
+
+        # A float64 represents every integer exactly only up to 2^53. An
+        # 18-digit ID number, a bank card, or a snowflake ID stored as a number
+        # therefore loses its last digits — silently, and before the file was
+        # even written. Nothing downstream can recover them.
+        if col.kind in _NUMERIC_KINDS and col.num_max is not None \
+                and abs(col.num_max) > FLOAT_EXACT_INT:
+            issues.append(Issue(
+                "high", "数值超出精确整数范围",
+                f"「{label}」最大值 {format_number(col.num_max)} 超过 2^53，"
+                f"浮点数无法精确表示，末位数字已经丢了",
+                column=col.name,
+                suggestion="身份证号 / 银行卡号 / 长 ID 必须存成文本，"
+                           "否则导出时就已损坏，下游无法还原",
+            ))
 
     # Near-perfectly correlated columns form one group. Reporting every pair
     # would emit three warnings for the same finding (A-B, A-C, B-C).
@@ -2130,13 +2269,30 @@ def score_bar(score: int, width: int = 22) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def format_number(value: float, *, compact: bool = False) -> str:
+    """Format a number the way a person reads it.
+
+    ``%g`` turns 13800138000 into ``1.38001e+10``, which is unreadable and — in
+    a column of ID numbers — actively misleading. Whole numbers are printed in
+    full with separators; only genuine fractions keep a decimal point.
+    """
+    if value != value or value in (float("inf"), float("-inf")):
+        return "—"
+    if value == int(value):
+        return f"{int(value):,}" if not compact else f"{int(value)}"
+    if compact:
+        return f"{value:g}"
+    return f"{value:,.2f}"
+
+
 def column_summary(col: ColumnProfile) -> str:
     """One-line human summary of what a column contains."""
     if col.kind == "empty":
         return "（无数据）"
     if col.kind in ("int", "float") and col.num_min is not None:
-        mean = f"{col.num_mean:,.2f}" if col.num_mean is not None else "—"
-        return f"{col.num_min:g} ~ {col.num_max:g}，均值 {mean}"
+        mean = format_number(col.num_mean) if col.num_mean is not None else "—"
+        return (f"{format_number(col.num_min)} ~ {format_number(col.num_max)}，"
+                f"均值 {mean}")
     if col.kind == "date" and col.date_min:
         return f"{col.date_min} ~ {col.date_max}"
     if col.kind == "bool":
@@ -3863,6 +4019,144 @@ def rules_to_json(results: list[RuleResult]) -> list[dict]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Data dictionary and badge
+# ---------------------------------------------------------------------------
+
+def _dict_range(col: ColumnProfile) -> str:
+    """The most useful one-line description of a column's values."""
+    if col.kind == "empty":
+        return "（无数据）"
+    if col.kind in ("int", "float") and col.num_min is not None:
+        return f"{format_number(col.num_min)} ~ {format_number(col.num_max)}"
+    if col.kind == "date" and col.date_min:
+        return f"{col.date_min} ~ {col.date_max}"
+    if col.top_values:
+        value, count = col.top_values[0]
+        return f"{truncate(value, 20)}（{count:,} 次）"
+    return "—"
+
+
+def _dict_note(col: ColumnProfile) -> str:
+    """Everything a reader needs to know before using this column."""
+    notes: list[str] = []
+    if col.pii:
+        notes.append("敏感：" + "、".join(col.pii))
+    if col.mismatch:
+        notes.append(f"{col.mismatch:,} 个值类型不符")
+    if col.formula_cells:
+        notes.append(f"{col.formula_cells:,} 个公式注入风险")
+    if col.ambiguous_dates:
+        notes.append(f"{col.ambiguous_dates:,} 个歧义日期")
+    if col.distinct_capped:
+        notes.append("唯一值过多")
+    if col.leading_space or col.trailing_space:
+        notes.append("有首尾空格")
+    if col.fullwidth:
+        notes.append("有全角字符")
+    return "；".join(notes) if notes else "—"
+
+
+def render_dictionary(profile: Profile) -> str:
+    """A Markdown data dictionary that can be pasted into a wiki or a ticket.
+
+    A profile is for reading once; a dictionary is for keeping. It answers the
+    question a new teammate actually asks — "what is in this column, and can I
+    trust it" — in a form that survives outside the terminal.
+    """
+    name = Path(profile.path).name
+    lines: list[str] = []
+    lines.append(f"# 数据字典 · {name}")
+    lines.append("")
+    lines.append(f"- 文件：`{profile.path}`")
+    lines.append(f"- 规模：{profile.rows:,} 行 × {profile.cols} 列")
+    lines.append(f"- 格式：{profile.fmt.upper()} · {profile.encoding} · "
+                 f"{'制表符' if profile.delimiter == chr(9) else profile.delimiter}分隔")
+    lines.append(f"- 体检评分：**{profile.score}/100**"
+                 f"（严重 {len(profile.issues_by('high'))} · "
+                 f"警告 {len(profile.issues_by('medium'))} · "
+                 f"提示 {len(profile.issues_by('low'))}）")
+    lines.append("")
+    lines.append("| 列名 | 类型 | 非空率 | 唯一值 | 取值范围 / 最常见 | 备注 |")
+    lines.append("|---|---|---|---|---|---|")
+
+    for col in profile.columns:
+        present = col.total - col.missing
+        filled = f"{present / col.total:.0%}" if col.total else "—"
+        distinct = ("≥" if col.distinct_capped else "") + f"{col.distinct:,}"
+        cells = [
+            f"`{col.name}`" if col.name else "（空列名）",
+            col.kind,
+            filled,
+            distinct,
+            _dict_range(col),
+            _dict_note(col),
+        ]
+        lines.append("| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |")
+
+    lines.append("")
+    if profile.issues:
+        lines.append("## 已知问题")
+        lines.append("")
+        for issue in profile.issues:
+            tag = {"high": "严重", "medium": "警告", "low": "提示"}[issue.severity]
+            lines.append(f"- **[{tag}] {issue.title}** — {issue.detail}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append(f"由 dataloupe v{__version__} 生成")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_badge(profile: Profile) -> str:
+    """A shields.io-style SVG badge carrying the health score.
+
+    Small enough to sit in a README, which is the point: a number someone can
+    put next to their project is a number they will keep up to date.
+    """
+    score = profile.score
+    if score >= 90:
+        color = "#2ea44f"
+    elif score >= 75:
+        color = "#3fb950"
+    elif score >= 60:
+        color = "#d29922"
+    elif score >= 40:
+        color = "#db6d28"
+    else:
+        color = "#cf222e"
+
+    label = "dataloupe"
+    value = f"{score}/100"
+    label_width = 8 * len(label) + 12
+    value_width = 8 * len(value) + 12
+    total = label_width + value_width
+    label_mid = label_width * 10 // 2
+    value_mid = label_width * 10 + value_width * 10 // 2
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{total}" height="20" '
+        f'role="img" aria-label="{label}: {value}">'
+        f'<title>{label}: {value}</title>'
+        f'<linearGradient id="s" x2="0" y2="100%">'
+        f'<stop offset="0" stop-color="#bbb" stop-opacity=".1"/>'
+        f'<stop offset="1" stop-opacity=".1"/></linearGradient>'
+        f'<clipPath id="r"><rect width="{total}" height="20" rx="3" fill="#fff"/></clipPath>'
+        f'<g clip-path="url(#r)">'
+        f'<rect width="{label_width}" height="20" fill="#555"/>'
+        f'<rect x="{label_width}" width="{value_width}" height="20" fill="{color}"/>'
+        f'<rect width="{total}" height="20" fill="url(#s)"/></g>'
+        f'<g fill="#fff" text-anchor="middle" '
+        f'font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">'
+        f'<text x="{label_mid}" y="15" fill="#010101" fill-opacity=".3">{label}</text>'
+        f'<text x="{label_mid}" y="14">{label}</text>'
+        f'<text x="{value_mid}" y="15" fill="#010101" fill-opacity=".3">{value}</text>'
+        f'<text x="{value_mid}" y="14">{value}</text>'
+        f'</g></svg>'
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dataloupe",
@@ -3897,6 +4191,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="按推断出的类型输出 CREATE TABLE 语句（postgres/mysql/sqlite）")
     parser.add_argument("--table", metavar="NAME", default=None,
                         help="配合 --sql：表名（默认取文件名）")
+    parser.add_argument("--dict", action="store_true", dest="as_dict",
+                        help="输出 Markdown 数据字典（默认 <原名>.dict.md）")
+    parser.add_argument("--badge", action="store_true",
+                        help="输出分数徽章 SVG（默认 <原名>.badge.svg）")
     parser.add_argument("--preview", action="store_true",
                         help="终端里额外打印前 20 行数据")
     parser.add_argument("--limit", type=int, default=None, metavar="N",
@@ -4042,6 +4340,19 @@ def main(argv: list[str] | None = None) -> int:
         if any(not result.ok for result in rule_results):
             failed = True
 
+    # -o means "write the HTML report" in every mode that does not already own
+    # the output path. Doing it here rather than at the end means --json -o
+    # produces both, which is what a CI step capturing JSON while archiving a
+    # report actually wants.
+    html_target: Path | None = None
+    if args.output and not (args.fix or args.mask or args.as_dict or args.badge):
+        html_target = Path(args.output).expanduser()
+        if not _write_or_report(
+            html_target,
+            lambda t: t.write_text(render_html(profile), encoding="utf-8"),
+        ):
+            return 2
+
     if args.as_json:
         print(render_json(profile, rule_results))
         return 1 if failed else 0
@@ -4049,6 +4360,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.sql:
         # A code generator: dirty data does not stop the schema from existing.
         print(render_sql(profile, args.sql, args.table))
+        return 0
+
+    if args.as_dict:
+        target = (Path(args.output).expanduser() if args.output
+                  else path.with_name(f"{path.stem}.dict.md"))
+        if not _write_or_report(
+            target, lambda t: t.write_text(render_dictionary(profile), encoding="utf-8")
+        ):
+            return 2
+        print(f"  数据字典已写入 {target}\n")
+        return 0
+
+    if args.badge:
+        target = (Path(args.output).expanduser() if args.output
+                  else path.with_name(f"{path.stem}.badge.svg"))
+        if not _write_or_report(
+            target, lambda t: t.write_text(render_badge(profile), encoding="utf-8")
+        ):
+            return 2
+        print(f"  分数徽章已写入 {target}\n")
         return 0
 
     print(render_terminal(profile, show_preview=args.preview))
@@ -4100,11 +4431,8 @@ def main(argv: list[str] | None = None) -> int:
             print(render_mask_report(mask_report))
         return 0
 
-    if args.output:
-        target = Path(args.output).expanduser()
-        if not _write_or_report(target, lambda t: t.write_text(render_html(profile), encoding="utf-8")):
-            return 2
-        print(f"  HTML 报告已写入 {target}\n")
+    if html_target is not None:
+        print(f"  HTML 报告已写入 {html_target}\n")
     else:
         print(dim("  -o report.html 生成网页报告  ·  --fix 清洗数据\n"))
 

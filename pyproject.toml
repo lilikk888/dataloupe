@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dataloupe"
-version = "1.5.0"
-description = "Zero-dependency data file profiler. See through any CSV, TSV, JSONL, JSON or XLSX file."
+version = "1.6.0"
+description = "Zero-dependency data file profiler and quality gate for CSV, TSV, JSONL, JSON and XLSX."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "lilikk888" }]
-keywords = ["csv", "data-quality", "profiling", "cli", "excel", "no-dependencies", "data-cleaning"]
+keywords = [
+    "csv", "data-quality", "data-profiling", "profiling", "cli",
+    "excel", "xlsx", "jsonl", "no-dependencies", "data-cleaning",
+    "data-validation", "pii", "schema-drift",
+]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -30,6 +34,8 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/lilikk888/dataloupe"
+Repository = "https://github.com/lilikk888/dataloupe"
+Changelog = "https://github.com/lilikk888/dataloupe/blob/main/CHANGELOG.md"
 Issues = "https://github.com/lilikk888/dataloupe/issues"
 
 [project.scripts]
@@ -37,3 +43,4 @@ dataloupe = "dataloupe:main"
 
 [tool.setuptools]
 py-modules = ["dataloupe"]
+license-files = ["LICENSE"]

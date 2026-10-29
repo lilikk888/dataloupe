@@ -25,6 +25,15 @@ orders.json
 schema-*.sql
 users_copy.csv
 
+# Artifacts the CI steps generate
+china.txt
+dict.md
+badge.svg
+both.html
+both.json
+*.dict.md
+*.badge.svg
+
 # Leftovers from tools/simulate_ci.py
 _ci_steps/
 

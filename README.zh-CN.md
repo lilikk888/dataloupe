@@ -7,7 +7,7 @@
 [![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-![dataloupe 输出](docs/terminal.svg)
+![dataloupe 输出](https://raw.githubusercontent.com/lilikk888/dataloupe/main/docs/terminal.svg)
 
 给它一个 CSV / TSV / JSONL / JSON / XLSX，它告诉你里面到底是什么：编码、
 分隔符、每列实际存了什么，以及**这份数据哪里有问题**。
@@ -17,32 +17,39 @@ python dataloupe.py sales.csv
 ```
 
 ```
-  dataloupe  v1.1.0
+  dataloupe  v1.6.0
 
-  messy.csv
-  CSV · UTF-8 · 逗号分隔 · 4.1KB
-  67 行 × 8 列 · 用时 0.02s
+  users.csv
+  CSV · UTF-8 · 逗号分隔 · 1.1KB
+  10 行 × 7 列 · 用时 0.02s
 
-  体检评分   54 / 100  ████████████░░░░░░░░░░  需要清理
+  体检评分   52 / 100  ███████████░░░░░░░░░░░  问题较多
 
-  问题：严重 4  警告 3  提示 2
+  问题：严重 4  警告 2  提示 0
 
-  列名      类型   缺失  唯一值  内容摘要
-  ────────  ─────  ────  ──────  ────────────────────────────
-  id        int      0%      61  2000 ~ 2999，均值 2,041.55
-  客户名称  text     0%       6  最常见「赵六」27%
-  金额      float   22%      44  100 ~ 8999.79，均值 3,719.03
-  日期      date    12%      50  2024-01-12 ~ 2024-12-22
-  状态      text     0%       3  最常见「处理中」37%
-  列7       empty  100%       0  （无数据）
+  列名     类型  缺失  唯一值  内容摘要
+  ───────  ────  ────  ──────  ──────────────────────────────────
+  id       int     0%      10  1 ~ 10，均值 5.50
+  name     text    0%      10  最常见「刘洋」10%
+  email    text    0%      10  最常见「chenjing@example.…」10%
+  phone    int     0%      10  13,000,130,000 ~ 13,912,345,678，…
+  id_card  int     0%      10  110,101,199,003,070,016 ~ 510,101…
+  address  text    0%      10  最常见「上海市浦东新区世…」10%
+  note     text    0%       3  最常见「普通用户」70%
+
+  ⚠ 疑似敏感信息  分享或入库前请先脱敏
+  ● email: 邮箱 100%
+  ● phone: 手机号 100%
+  ● id_card: 身份证号 100%
 
   发现的问题
-  ● 严重  列名重复
-      「状态」出现了 2 次，读取时后一列会覆盖前一列
-      → 重命名后重新导出，否则按列名取值只会拿到其中一列
-  ● 警告  存在重复行
-      6 行（9.0%）与其他行完全相同
-      → 去重前先确认重复是采集错误还是业务上本就允许
+  ● 严重  疑似包含敏感信息
+      「email」样本中有 邮箱 100% 命中
+      → 确认该列是否含有 PII/密钥；在分享或入库前先做脱敏
+  ● 严重  数值超出精确整数范围
+      「id_card」最大值 510,101,199,512,080,064 超过 2^53，
+      浮点数无法精确表示，末位数字已经丢了
+      → 身份证号 / 银行卡号 / 长 ID 必须存成文本
 ```
 
 加 `-o report.html` 会生成一份**单文件网页报告**：带图表、列卡片、按严重度
@@ -106,6 +113,14 @@ python dataloupe.py last_week.csv today.csv --diff
 
 # 声明式契约：不满足就退出码 1
 python dataloupe.py data.csv --require "id:not-null" --require "rows>=1000"
+
+# 出一份 Markdown 数据字典 / 一个分数徽章
+python dataloupe.py data.csv --dict
+python dataloupe.py data.csv --badge
+
+# 出一份 Markdown 数据字典 / 一个分数徽章
+python dataloupe.py data.csv --dict
+python dataloupe.py data.csv --badge
 
 # 修好数据另存一份（原文件不动）
 python dataloupe.py data.csv --fix
@@ -245,7 +260,7 @@ python dataloupe.py last_week.csv today.csv --diff -o drift.html
   结论：破坏性变更。
 ```
 
-![漂移对比输出](docs/diff.svg)
+![漂移对比输出](https://raw.githubusercontent.com/lilikk888/dataloupe/main/docs/diff.svg)
 
 它会抓这些事：
 
@@ -318,7 +333,7 @@ python dataloupe.py orders.csv \
 ```
 
 ```text
-  dataloupe  v1.5.0  数据契约
+  dataloupe  v1.6.0  数据契约
 
   ✓ order_id:not-null        没有缺失值
   ✓ order_id:unique          240 个值全部唯一
@@ -330,7 +345,7 @@ python dataloupe.py orders.csv \
   ✗ 2/6 条不通过。
 ```
 
-![数据契约输出](docs/rules.svg)
+![数据契约输出](https://raw.githubusercontent.com/lilikk888/dataloupe/main/docs/rules.svg)
 
 支持这些写法：
 
@@ -356,6 +371,66 @@ python dataloupe.py orders.csv \
 - **拿文本列比大小会报"不是数值"**，而不是悄悄放过。
 
 `--json` 会把结果放在 `rules` 字段里，方便程序读。
+
+---
+
+## 中国数据，真的看得懂
+
+大多数数据工具是英文优先的，碰到这些就哑了。dataloupe 反过来做：
+
+| 能力 | 说明 |
+|---|---|
+| 编码 | GBK / GB18030 / Big5 自动识别，不会读成乱码 |
+| 全角字符 | `１２３`、`ＡＢＣ` 单独标出——肉眼一样，程序算错 |
+| 中文列名 | 表格按东亚字符宽度对齐，不会错位 |
+| **身份证校验位** | GB 11643 加权模 11，能算出"这个号是编的" |
+| **统一社会信用代码** | GB 32100-2015，模 31 校验 |
+| **组织机构代码** | 模 11 校验 |
+| **车牌号** | 省份简称 + 发牌机关字母，新能源 6 位也认 |
+| **2^53 精度** | 18 位身份证存成数值会丢末位——**导出时就坏了**，不是读取时 |
+
+校验位不通过单独报，因为"号码是编的"和"号码泄露了"是两件事：
+
+```text
+● 警告  证件号校验位不通过
+    「legal_person_id」7 个身份证号里有 2 个算不对校验位（29%）
+    → 校验位错说明号码是编的或录入错了，不是真实证件号
+```
+
+`examples/china.csv` 是一份可以直接跑的例子（含两个故意写错的校验位）。
+
+---
+
+## 数据字典、徽章、CI
+
+**`--dict`** 出一份 Markdown 数据字典，直接贴进 wiki 或工单：
+
+```bash
+dataloupe data.csv --dict        # -> data.dict.md
+```
+
+| 列名 | 类型 | 非空率 | 唯一值 | 取值范围 / 最常见 | 备注 |
+|---|---|---|---|---|---|
+| `email` | text | 100% | 10 | chenjing@example.com（1 次） | 敏感：邮箱 |
+
+**`--badge`** 出一个分数徽章，放进自己项目的 README：
+
+```bash
+dataloupe data.csv --badge       # -> data.badge.svg
+```
+
+**GitHub Action** 一行接进 CI（Marketplace 搜 dataloupe）：
+
+```yaml
+- uses: lilikk888/dataloupe@main
+  with:
+    file: data/export.csv
+    require: |
+      id:not-null
+      amount:>0
+      rows>=1000
+    fail-under: 85
+```
 
 ---
 
@@ -442,20 +517,18 @@ python dataloupe.py orders.csv \
 
 ## 安装
 
-不用装：
+```bash
+pip install dataloupe
+dataloupe data.csv
+```
+
+或者不装，直接下载单个文件：
 
 ```bash
 python dataloupe.py data.csv
 ```
 
-需要 Python 3.8+，别的什么都不用。
-
-想在命令行里直接敲 `dataloupe`：
-
-```bash
-pip install .
-dataloupe data.csv
-```
+需要 Python 3.9+。没有别的依赖——不是"依赖很少"，是**一个都没有**。
 
 ---
 

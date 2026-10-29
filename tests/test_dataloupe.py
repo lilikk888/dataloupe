@@ -1617,5 +1617,173 @@ class TestRules(unittest.TestCase):
         self.assertTrue(payload["rules"][0]["ok"])
 
 
+class TestChinaChecksums(unittest.TestCase):
+    """Check digits are the difference between "looks like an ID" and "is one"."""
+
+    def test_id_card_matches_the_gb_example(self):
+        # 11010519491231002X is the worked example from GB 11643.
+        self.assertTrue(dl.id_card_checksum_ok("11010519491231002X"))
+        self.assertFalse(dl.id_card_checksum_ok("110105194912310021"))
+
+    def test_legacy_15_digit_id_has_no_check_digit(self):
+        # "unknown" must not be reported as "wrong".
+        self.assertIsNone(dl.id_card_checksum_ok("110105491231002"))
+
+    def test_uscc_matches_known_codes(self):
+        self.assertTrue(dl.uscc_checksum_ok("91350100M000100Y43"))
+        self.assertTrue(dl.uscc_checksum_ok("91110108551385082Q"))
+        self.assertFalse(dl.uscc_checksum_ok("91110108551385082R"))
+
+    def test_uscc_rejects_letters_outside_the_alphabet(self):
+        # I, O, S, V, Z are deliberately not issued.
+        self.assertFalse(dl.uscc_checksum_ok("91110108MA0ABC03DZ"))
+
+    def test_org_code(self):
+        self.assertTrue(dl.org_code_checksum_ok("123456788"))
+        self.assertFalse(dl.org_code_checksum_ok("123456789"))
+
+    def test_failures_are_counted_per_label(self):
+        sample = [
+            "11010519491231002X",   # valid
+            "110105194912310021",   # bad check digit
+            "91350100M000100Y43",   # valid USCC
+            "91110108551385082R",   # bad USCC
+        ]
+        report = dl.checksum_failures(sample)
+        self.assertEqual(report["身份证号"], (2, 1))
+        self.assertEqual(report["统一社会信用代码"], (2, 1))
+
+    def test_reported_as_a_medium_issue(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "ids.csv"
+        path.write_text(
+            "name,id_card\n"
+            + "".join(f"n{i},110105194912310021\n" for i in range(12)),
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        titles = [i.title for i in profile.issues if i.column == "id_card"]
+        self.assertIn("证件号校验位不通过", titles)
+
+
+class TestPrecisionLimit(unittest.TestCase):
+    """18-digit IDs stored as numbers lose their last digits before we see them."""
+
+    def test_huge_integers_are_flagged(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "big.csv"
+        path.write_text("id\n110101199003070011\n110101199003070022\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        titles = [i.title for i in profile.issues]
+        self.assertIn("数值超出精确整数范围", titles)
+
+    def test_normal_integers_are_not_flagged(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "small.csv"
+        path.write_text("id\n1\n2\n3\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertNotIn("数值超出精确整数范围", [i.title for i in profile.issues])
+
+
+class TestNumberFormatting(unittest.TestCase):
+    def test_large_integers_do_not_use_exponent(self):
+        self.assertEqual(dl.format_number(13800138000), "13,800,138,000")
+        self.assertEqual(dl.format_number(110101199003070016), "110,101,199,003,070,016")
+
+    def test_fractions_keep_decimals(self):
+        self.assertEqual(dl.format_number(45.6), "45.60")
+
+    def test_non_finite(self):
+        self.assertEqual(dl.format_number(float("nan")), "—")
+        self.assertEqual(dl.format_number(float("inf")), "—")
+
+
+class TestDictionary(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = self.directory / "data.csv"
+        self.path.write_text(
+            "id,email,amount\n"
+            + "".join(f"{i},user{i}@example.com,{i * 10}\n" for i in range(12)),
+            encoding="utf-8",
+        )
+
+    def test_markdown_has_a_row_per_column(self):
+        profile = dl.analyse(self.path)
+        text = dl.render_dictionary(profile)
+        self.assertIn("# 数据字典", text)
+        self.assertIn("| 列名 | 类型 |", text)
+        for name in ("id", "email", "amount"):
+            self.assertIn(f"`{name}`", text)
+
+    def test_sensitive_columns_are_noted(self):
+        profile = dl.analyse(self.path)
+        text = dl.render_dictionary(profile)
+        self.assertIn("敏感：邮箱", text)
+
+    def test_cli_writes_the_file(self):
+        target = self.directory / "out.md"
+        self.assertEqual(
+            dl.main([str(self.path), "--no-color", "--dict", "-o", str(target)]), 0)
+        self.assertIn("数据字典", target.read_text(encoding="utf-8"))
+
+    def test_pipe_in_a_cell_is_escaped(self):
+        path = self.directory / "pipes.csv"
+        path.write_text("a|b\n1\n2\n", encoding="utf-8")
+        text = dl.render_dictionary(dl.analyse(path))
+        # A literal pipe inside a table cell would break the row.
+        self.assertIn("a\\|b", text)
+
+
+class TestBadge(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def test_svg_carries_the_score(self):
+        path = self.directory / "clean.csv"
+        path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        svg = dl.render_badge(profile)
+        self.assertTrue(svg.startswith("<svg"))
+        self.assertIn(f"{profile.score}/100", svg)
+
+    def test_colour_changes_with_the_score(self):
+        class Fake:
+            score = 20
+        self.assertIn("#cf222e", dl.render_badge(Fake()))
+
+        class Good:
+            score = 99
+        self.assertIn("#2ea44f", dl.render_badge(Good()))
+
+    def test_cli_writes_the_file(self):
+        path = self.directory / "x.csv"
+        path.write_text("a\n1\n", encoding="utf-8")
+        target = self.directory / "x.svg"
+        self.assertEqual(dl.main([str(path), "--no-color", "--badge", "-o", str(target)]), 0)
+        self.assertIn("<svg", target.read_text(encoding="utf-8"))
+
+
+class TestChinaMasking(unittest.TestCase):
+    def test_uscc_keeps_the_authority_prefix(self):
+        masked, label = dl.mask_cell("91350100M000100Y43")
+        self.assertEqual(label, "统一社会信用代码")
+        self.assertEqual(masked, "9135**********0Y43")
+
+    def test_plate_keeps_province_and_city(self):
+        masked, label = dl.mask_cell("浙A12345")
+        self.assertEqual(label, "车牌号")
+        self.assertEqual(masked, "浙A****5")
+
+    def test_masked_uscc_no_longer_matches(self):
+        masked, _ = dl.mask_cell("91350100M000100Y43")
+        self.assertFalse(dl.uscc_checksum_ok(masked))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

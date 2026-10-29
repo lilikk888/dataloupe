@@ -1,0 +1,101 @@
+name: dataloupe
+description: >-
+  Zero-dependency data quality gate. Profiles a CSV/TSV/JSONL/JSON/XLSX file,
+  enforces declared contracts, and fails the job when the data is not fit for use.
+author: lilikk888
+branding:
+  icon: search
+  color: purple
+
+inputs:
+  file:
+    description: Path (or glob) to the data file to check.
+    required: true
+  require:
+    description: >-
+      Data contract, one rule per line. Example:
+      "id:not-null" / "amount:>=0" / "status:in(paid|pending)" / "rows>=100".
+    required: false
+    default: ""
+  fail-under:
+    description: Fail when the health score is below this number (0-100).
+    required: false
+    default: ""
+  args:
+    description: Extra arguments passed straight to dataloupe.
+    required: false
+    default: ""
+  report:
+    description: >-
+      If set, write a self-contained HTML report to this path.
+    required: false
+    default: ""
+
+outputs:
+  score:
+    description: The health score dataloupe computed (0-100).
+    value: ${{ steps.run.outputs.score }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        DL_FILE: ${{ inputs.file }}
+        DL_REQUIRE: ${{ inputs.require }}
+        DL_FAIL_UNDER: ${{ inputs.fail-under }}
+        DL_EXTRA: ${{ inputs.args }}
+        DL_REPORT: ${{ inputs.report }}
+        DL_HOME: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        # On Windows runners bash may hand Python a POSIX-style path, which
+        # python.exe then resolves against the current drive (C:\c\Users\...).
+        # cygpath -m gives the mixed form both sides understand.
+        if command -v cygpath >/dev/null 2>&1; then
+          DL_HOME="$(cygpath -m "$DL_HOME")"
+        fi
+
+        args=("$DL_HOME/dataloupe.py" "$DL_FILE" --no-color)
+
+        if [ -n "${DL_FAIL_UNDER}" ]; then
+          args+=(--fail-under "$DL_FAIL_UNDER")
+        fi
+
+        # One rule per line. A comma would collide with in(a,b) and with
+        # regular expressions, so newline is the only separator.
+        if [ -n "${DL_REQUIRE}" ]; then
+          while IFS= read -r rule; do
+            rule="$(printf '%s' "$rule" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$rule" ] && continue
+            args+=(--require "$rule")
+          done <<< "$DL_REQUIRE"
+        fi
+
+        if [ -n "${DL_REPORT}" ]; then
+          args+=(-o "$DL_REPORT")
+        fi
+
+        if [ -n "${DL_EXTRA}" ]; then
+          # Word splitting is intended here: the caller passes a flag string.
+          # shellcheck disable=SC2206
+          args+=($DL_EXTRA)
+        fi
+
+        # Capture the score from the JSON form without running twice: ask for
+        # JSON, print it, and pull the number out of it.
+        set +e
+        json="$(python "${args[@]}" --json 2>&1)"
+        code=$?
+        set -e
+
+        printf '%s\n' "$json"
+        score="$(printf '%s' "$json" | python -c \
+          'import json,sys;print(json.load(sys.stdin)["score"])' 2>/dev/null || echo "")"
+        if [ -n "$score" ]; then
+          echo "score=$score" >> "$GITHUB_OUTPUT"
+        fi
+
+        exit "$code"

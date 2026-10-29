@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.6.0
+
+Chinese identity checks, a data dictionary, a score badge, and a GitHub Action.
+
+**Check digits, not just patterns.** An 18-digit string that looks like an ID
+card is not one. `dataloupe` now verifies:
+
+| Kind | Standard | Test |
+|---|---|---|
+| 身份证号 | GB 11643 | weighted mod 11, `X` for 10 |
+| 统一社会信用代码 | GB 32100-2015 | mod 31 over a 31-character alphabet |
+| 组织机构代码 | — | mod 11, `X` for 10 |
+
+All three are verified against published worked examples, not just against
+themselves. A failed check digit is reported as **证件号校验位不通过** — a
+medium-severity data-quality issue, separate from the PII finding, because "the
+number is invented" and "the number leaked" are different problems. The 15-digit
+legacy ID format has no check digit and is explicitly reported as unknown rather
+than wrong.
+
+**2^53.** An 18-digit ID stored as a number has already lost its last digits
+before dataloupe ever reads it: float64 represents integers exactly only up to
+2^53. Columns exceeding that now raise a high-severity issue explaining that the
+damage happened at export time and cannot be undone downstream.
+
+**`--dict`** writes a Markdown data dictionary — column, type, fill rate,
+distinct count, range, and a note covering PII, type pollution, formula
+injection and ambiguity. Made to be pasted into a wiki rather than read once.
+
+**`--badge`** writes a shields-style SVG carrying the health score, so a project
+can display the number next to its own README.
+
+**`action.yml`** — a composite GitHub Action. One `uses:` line, with `require`,
+`fail-under` and `report` inputs and a `score` output.
+
+Also: numbers no longer print as `1.38001e+10` (a column of phone numbers used to
+be unreadable); `--json -o` now writes the HTML report as well instead of
+silently dropping it; `examples/china.csv`; 218 tests.
+
 ## 1.5.0
 
 Two things: the report now names the cells to go fix, and `--require` turns
