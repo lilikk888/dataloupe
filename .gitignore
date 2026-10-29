@@ -15,6 +15,18 @@ htmlcov/
 # Generated reports
 report.html
 *.report.html
+drift.html
+messy.html
+masked.csv
+*.masked.csv
+*.cleaned.csv
+customers.json
+orders.json
+schema-*.sql
+users_copy.csv
+
+# Leftovers from tools/simulate_ci.py
+_ci_steps/
 
 # Editors
 .vscode/

@@ -1456,5 +1456,166 @@ class TestMask(unittest.TestCase):
         self.assertIn("************1111", target.read_text(encoding="utf-8-sig"))
 
 
+class TestBadSamples(unittest.TestCase):
+    """The report should name the values to go fix, not just count them."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def test_unparseable_values_are_captured(self):
+        path = self.directory / "mixed.csv"
+        path.write_text(
+            "amount\n1\n2\n3\n4\n5\n6\n7\n8\n9\nTBD\nN/A?\n",
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        self.assertEqual(profile.columns[0].bad_samples, ["TBD", "N/A?"])
+
+    def test_thousands_separator_is_not_a_bad_value(self):
+        path = self.directory / "money.csv"
+        path.write_text("amount\n1,234\n2,345\n3,456\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertEqual(profile.columns[0].bad_samples, [])
+
+    def test_samples_are_capped(self):
+        path = self.directory / "many.csv"
+        path.write_text("v\n" + "".join(f"bad{i}\n" for i in range(50)), encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertLessEqual(len(profile.columns[0].bad_samples), dl.BAD_SAMPLE_CAP)
+
+    def test_issue_names_the_offending_values(self):
+        path = self.directory / "mixed2.csv"
+        path.write_text(
+            "amount\n" + "".join(f"{i}\n" for i in range(1, 10)) + "TBD\nN/A?\n",
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        detail = next(i.detail for i in profile.issues if i.title == "类型混杂")
+        self.assertIn("TBD", detail)
+        self.assertIn("N/A?", detail)
+
+    def test_bad_dates_are_captured(self):
+        path = self.directory / "dates.csv"
+        path.write_text(
+            "when\n2024-01-01\n2024-01-02\n2024-01-03\nnot-a-date\n",
+            encoding="utf-8",
+        )
+        profile = dl.analyse(path)
+        self.assertIn("not-a-date", profile.columns[0].bad_samples)
+
+
+class TestRules(unittest.TestCase):
+    """`--require` turns expectations into a pass/fail gate."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = self.directory / "data.csv"
+        self.path.write_text(
+            "id,amount,status,when\n"
+            "1,10,active,2024-01-05\n"
+            "2,20,pending,2024-02-05\n"
+            "3,30,active,2024-03-05\n",
+            encoding="utf-8",
+        )
+        self.profile = dl.analyse(self.path)
+
+    def _check(self, *rules):
+        return dl.check_rules(self.profile, self.path, list(rules))
+
+    def test_parse_each_form(self):
+        self.assertEqual(dl.parse_rule("id:not-null")[2], "not-null")
+        self.assertEqual(dl.parse_rule("id:unique")[2], "unique")
+        self.assertEqual(dl.parse_rule("amount:>=0")[3], (">=", 0.0))
+        self.assertEqual(dl.parse_rule("status:in(a|b)")[3], {"a", "b"})
+        self.assertEqual(dl.parse_rule("rows>=100")[0], "table")
+        self.assertEqual(dl.parse_rule("when:>=2024-01-01")[2], "compare-date")
+
+    def test_bad_syntax_is_reported_not_ignored(self):
+        with self.assertRaises(ValueError):
+            dl.parse_rule("this is not a rule")
+        with self.assertRaises(ValueError):
+            dl.parse_rule("id:")
+        with self.assertRaises(ValueError):
+            dl.parse_rule("x:matches([)")
+
+    def test_not_null_passes_and_fails(self):
+        ok = self._check("id:not-null")[0]
+        self.assertTrue(ok.ok)
+
+        # Two columns: a blank line in a one-column file is an empty row that
+        # gets skipped, not a missing cell.
+        path = self.directory / "gaps.csv"
+        path.write_text("id,name\n1,a\n2,\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        result = dl.check_rules(profile, path, ["name:not-null"])[0]
+        self.assertFalse(result.ok)
+        self.assertIn("缺失", result.detail)
+
+    def test_unique(self):
+        self.assertTrue(self._check("id:unique")[0].ok)
+
+        path = self.directory / "dups.csv"
+        path.write_text("id\n1\n1\n2\n", encoding="utf-8")
+        profile = dl.analyse(path)
+        self.assertFalse(dl.check_rules(profile, path, ["id:unique"])[0].ok)
+
+    def test_numeric_comparison(self):
+        self.assertTrue(self._check("amount:>=10")[0].ok)
+        self.assertFalse(self._check("amount:>=100")[0].ok)
+        self.assertTrue(self._check("amount:<=30")[0].ok)
+        self.assertFalse(self._check("amount:<30")[0].ok)
+
+    def test_date_comparison(self):
+        self.assertTrue(self._check("when:>=2024-01-01")[0].ok)
+        self.assertFalse(self._check("when:>=2024-06-01")[0].ok)
+
+    def test_comparison_on_text_column_is_an_error_not_a_pass(self):
+        result = self._check("status:>=0")[0]
+        self.assertFalse(result.ok)
+        self.assertIn("不是数值", result.detail)
+
+    def test_in_and_matches_scan_the_values(self):
+        self.assertTrue(self._check("status:in(active|pending)")[0].ok)
+        bad = self._check("status:in(active)")[0]
+        self.assertFalse(bad.ok)
+        self.assertIn("pending", bad.detail)
+        self.assertTrue(self._check(r"status:matches(^[a-z]+$)")[0].ok)
+
+    def test_table_level_rules(self):
+        self.assertTrue(self._check("rows>=3")[0].ok)
+        self.assertFalse(self._check("rows>10")[0].ok)
+        self.assertTrue(self._check("cols=4")[0].ok)
+
+    def test_missing_column_fails_with_a_hint(self):
+        result = self._check("nope:not-null")[0]
+        self.assertFalse(result.ok)
+        self.assertIn("没有这一列", result.detail)
+
+    def test_cli_exit_code_reflects_the_contract(self):
+        self.assertEqual(
+            dl.main([str(self.path), "--no-color", "--require", "id:not-null"]), 0)
+        self.assertEqual(
+            dl.main([str(self.path), "--no-color", "--require", "rows>=100"]), 1)
+
+    def test_contract_does_not_leak_into_sql_mode(self):
+        # --sql is a code generator; a broken contract should not stop it.
+        self.assertEqual(
+            dl.main([str(self.path), "--no-color", "--sql", "postgres",
+                     "--require", "rows>=100"]), 0)
+
+    def test_json_carries_the_rule_results(self):
+        import contextlib
+        import io
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            dl.main([str(self.path), "--json", "--require", "rows>=3"])
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["rules"][0]["rule"], "rows>=3")
+        self.assertTrue(payload["rules"][0]["ok"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

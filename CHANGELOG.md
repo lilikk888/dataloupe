@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.5.0
+
+Two things: the report now names the cells to go fix, and `--require` turns
+expectations into a gate.
+
+**Offending values are shown, not just counted.** "12 values do not parse as
+int" told you a number; it did not tell you which cells. The first three
+unparseable values per column are now kept and printed:
+`判定为 int，但有 3 个值不是（25.0%），例如 「TBD」、「N/A?」、「1 200」`.
+Thousands separators are explicitly *not* treated as bad — `1,234` parses once
+the separator is dropped, so it is a valid value.
+
+**`--require RULE` declares a data contract.** Repeatable, and any failure
+exits 1, so it works as a CI gate without a separate config file:
+
+```bash
+python dataloupe.py orders.csv \
+  --require "order_id:not-null" \
+  --require "order_id:unique" \
+  --require "amount:>0" \
+  --require "status:in(paid|pending|refunded)" \
+  --require "order_date:>=2024-01-01" \
+  --require "rows>=1000"
+```
+
+Supported: `not-null`, `unique`, numeric comparison (`>= > <= < =`), date
+comparison against `YYYY-MM-DD`, `in(a|b|c)`, `matches(REGEX)`, and the
+table-level `rows` / `cols` comparisons. Everything that can be answered from
+the profile is; only `in(...)` and `matches(...)` need a pass over the values,
+and all such rules share a single pass rather than one per rule.
+
+A syntax mistake fails the rule instead of being ignored — a typo in a contract
+must not look like a pass. Comparing a text column with `>=` reports "not
+numeric" rather than silently passing.
+
+`--json` carries the results under `rules`, so a pipeline can read them.
+
+Also: 196 tests.
+
 ## 1.4.0
 
 Three additions that turn `--diff` into a real pipeline check, plus the ability

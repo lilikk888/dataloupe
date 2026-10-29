@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Iterator
 from xml.etree import ElementTree as ET
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -88,6 +88,10 @@ DEDUP_CAP = 200_000
 #: phone numbers, ID cards...). Bounded, so it costs the same on a 10-row file
 #: as on a 10-million-row one.
 PII_SAMPLE_CAP = 200
+
+#: How many offending values to keep per column. Enough to show the reader what
+#: to go fix, few enough to stay readable in a terminal line.
+BAD_SAMPLE_CAP = 3
 
 #: Upper bound on distinct row fingerprints held per side when comparing the
 #: rows of two exports. Two sets of 500k 64-bit keys cost roughly 60 MB; past
@@ -1165,6 +1169,8 @@ class ColumnProfile:
     fullwidth: int = 0
     control_chars: int = 0
     formula_cells: int = 0
+    #: First few values that did not parse as the inferred kind.
+    bad_samples: list[str] = field(default_factory=list)
     # raw values kept for sensitive-pattern detection (flat, capped)
     value_sample_raw: list[str] = field(default_factory=list)
     # PII labels -> share of sampled cells that match (set by find_issues)
@@ -1292,6 +1298,7 @@ class ColumnAccumulator:
         "_hygiene_seen", "_leading", "_trailing", "_fullwidth", "_control",
         "_formula",
         "_pii_sample", "_pii_seen", "_pii_rng", "_pii_w", "_pii_next",
+        "_bad_samples",
     )
 
     def __init__(self, name: str, index: int) -> None:
@@ -1340,6 +1347,9 @@ class ColumnAccumulator:
 
         # Bounded reservoir of raw text, purely for sensitive-pattern scans.
         self._pii_sample: list[str] = []
+        # First few values that failed to parse as the committed kind. Shown in
+        # the report so the reader knows *which* cells to go fix.
+        self._bad_samples: list[str] = []
         self._pii_seen = 0
         self._pii_rng = random.Random(RESERVOIR_SEED + 2_000_000 + index)
         self._pii_w = 1.0
@@ -1417,11 +1427,23 @@ class ColumnAccumulator:
         except ValueError:
             # Thousands separators are the only common fix-up worth trying.
             if "," not in text:
+                self._note_bad(text)
                 return
             try:
                 x = float(text.replace(",", ""))
             except ValueError:
+                self._note_bad(text)
                 return
+            # "1,234" parsed fine once the separator was dropped: it is a valid
+            # value, not an offending one.
+        self._fold_number(x)
+
+    def _note_bad(self, text: str) -> None:
+        """Keep the first few offending values, so the report can name them."""
+        if len(self._bad_samples) < BAD_SAMPLE_CAP:
+            self._bad_samples.append(text)
+
+    def _fold_number(self, x: float) -> None:
 
         if x < self._num_min:
             self._num_min = x
@@ -1450,6 +1472,8 @@ class ColumnAccumulator:
                 self._date_min = stamp
             if self._date_max is None or stamp > self._date_max:
                 self._date_max = stamp
+        else:
+            self._note_bad(text)
         if self._dated < TYPE_SAMPLE:
             self._dated += 1
             shape = detect_date_format(text)
@@ -1536,6 +1560,7 @@ class ColumnAccumulator:
         # Raw strings are kept for every column, so a phone number stored as a
         # bare 11-digit string (in an int column) still gets scanned.
         col.value_sample_raw = list(self._pii_sample)
+        col.bad_samples = list(self._bad_samples)
         col.leading_space = self._leading
         col.trailing_space = self._trailing
         col.fullwidth = self._fullwidth
@@ -1768,8 +1793,15 @@ def find_issues(profile: Profile) -> list[Issue]:
         if col.kind != "text" and col.mismatch:
             rate = col.mismatch / max(col.total - col.missing, 1)
             if rate >= 0.05:
+                # Naming the offending values turns "there are 12 bad cells"
+                # into something the reader can actually go and fix.
+                examples = ""
+                if col.bad_samples:
+                    shown = "、".join(f"「{truncate(v, 14)}」" for v in col.bad_samples)
+                    examples = f"，例如 {shown}"
                 issues.append(Issue("medium", "类型混杂",
-                                    f"「{label}」判定为 {col.kind}，但有 {col.mismatch} 个值不是（{rate:.1%}）",
+                                    f"「{label}」判定为 {col.kind}，但有 {col.mismatch} 个值不是"
+                                    f"（{rate:.1%}）{examples}",
                                     column=col.name,
                                     suggestion="这些值多为空格、占位符或单位混写，清洗后可正常计算"))
 
@@ -2580,7 +2612,7 @@ def render_html(profile: Profile) -> str:
 # JSON output
 # ---------------------------------------------------------------------------
 
-def render_json(profile: Profile) -> str:
+def render_json(profile: Profile, rules: list["RuleResult"] | None = None) -> str:
     payload = {
         "file": profile.path,
         "format": profile.fmt,
@@ -2618,10 +2650,13 @@ def render_json(profile: Profile) -> str:
                 "top_values": c.top_values,
                 "formula_cells": c.formula_cells,
                 "pii": c.pii,
+                "bad_samples": c.bad_samples,
             }
             for c in profile.columns
         ],
     }
+    if rules:
+        payload["rules"] = rules_to_json(rules)
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -3512,6 +3547,322 @@ def render_diff_html(diff: SchemaDiff) -> str:
 </html>"""
 
 
+# ---------------------------------------------------------------------------
+# Data contracts
+# ---------------------------------------------------------------------------
+
+#: A numeric comparison body: ``>=0``, ``< 100``, ``=3`` and so on.
+_RULE_COMPARE_RE = re.compile(r"^(>=|<=|>|<|=)\s*(-?\d+(?:\.\d+)?)$")
+#: A date comparison body: ``>=2024-01-01``.
+_RULE_DATE_RE = re.compile(r"^(>=|<=|>|<|=)\s*(\d{4}-\d{2}-\d{2})$")
+#: A table-level rule: ``rows>=100``, ``cols<=30``.
+_RULE_TABLE_RE = re.compile(r"^(rows|cols)\s*(>=|<=|>|<|=)\s*(\d+)$", re.IGNORECASE)
+
+
+@dataclass
+class RuleResult:
+    """One declared expectation and whether the data met it."""
+    rule: str
+    ok: bool
+    detail: str
+    column: str | None = None
+
+
+def _compare(actual: float, op: str, target: float) -> bool:
+    if op == ">=":
+        return actual >= target
+    if op == "<=":
+        return actual <= target
+    if op == ">":
+        return actual > target
+    if op == "<":
+        return actual < target
+    return actual == target
+
+
+def parse_rule(text: str) -> tuple[str, str, str, object]:
+    """Split one rule into ``(scope, column, kind, payload)``.
+
+    Raises ``ValueError`` with a readable message when the syntax is wrong — a
+    typo in a contract should stop the run, not silently pass.
+    """
+    rule = text.strip()
+    if not rule:
+        raise ValueError("规则为空")
+
+    table = _RULE_TABLE_RE.match(rule)
+    if table:
+        name, op, value = table.groups()
+        return "table", name.lower(), "compare", (op, float(value))
+
+    if ":" not in rule:
+        raise ValueError(
+            f"看不懂这条规则：{text!r}。"
+            f"写法示例：id:not-null、amount:>=0、status:in(a|b)、rows>=100"
+        )
+
+    column, body = rule.split(":", 1)
+    column = column.strip()
+    body = body.strip()
+    if not column:
+        raise ValueError(f"规则缺少列名：{text!r}")
+
+    lowered = body.lower()
+    if lowered in ("not-null", "notnull", "非空"):
+        return "column", column, "not-null", None
+    if lowered in ("unique", "唯一"):
+        return "column", column, "unique", None
+
+    compare = _RULE_COMPARE_RE.match(body)
+    if compare:
+        op, value = compare.groups()
+        return "column", column, "compare", (op, float(value))
+
+    dated = _RULE_DATE_RE.match(body)
+    if dated:
+        op, value = dated.groups()
+        stamp = parse_date(value)
+        if stamp is None:
+            raise ValueError(f"日期写错了：{value!r}")
+        return "column", column, "compare-date", (op, stamp)
+
+    if lowered.startswith("in(") and body.endswith(")"):
+        raw = body[3:-1]
+        options = [part.strip() for part in raw.split("|") if part.strip()]
+        if not options:
+            raise ValueError(f"in(...) 里没有可选值：{text!r}")
+        return "column", column, "in", set(options)
+
+    if lowered.startswith("matches(") and body.endswith(")"):
+        pattern = body[len("matches("):-1]
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"正则写错了：{pattern!r}（{exc}）") from exc
+        return "column", column, "matches", compiled
+
+    raise ValueError(
+        f"看不懂这条规则：{text!r}。"
+        f"支持 not-null / unique / 比较运算 / 日期比较 / in(...) / matches(...)"
+    )
+
+
+def _scan_values(
+    path: Path,
+    rules: list[tuple[int, str, str, object]],
+    limit: int | None,
+) -> dict[int, tuple[int, list[str]]]:
+    """Evaluate every value-level rule in a single pass over the file.
+
+    Returns ``{rule_index: (bad_count, examples)}``. One pass for all rules
+    rather than one pass per rule: a contract with ten clauses should not read
+    the file ten times.
+    """
+    stream, rows = iter_source(path, limit)
+    index = {name: i for i, name in enumerate(stream.header)}
+
+    state: dict[int, tuple[int, list[str]]] = {i: (0, []) for i, *_ in rules}
+    usable = []
+    for i, column, kind, payload in rules:
+        position = index.get(column)
+        if position is not None:
+            usable.append((i, position, kind, payload))
+
+    try:
+        if usable:
+            for row in rows:
+                for i, position, kind, payload in usable:
+                    cell = row[position] if position < len(row) else ""
+                    text = cell.strip()
+                    if not text:
+                        continue
+                    if kind == "in":
+                        bad = text not in payload
+                    else:
+                        bad = payload.match(text) is None
+                    if not bad:
+                        continue
+                    count, examples = state[i]
+                    count += 1
+                    if len(examples) < BAD_SAMPLE_CAP:
+                        examples.append(text)
+                    state[i] = (count, examples)
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
+    return state
+
+
+def check_rules(
+    profile: Profile,
+    path: Path,
+    rules: list[str],
+    limit: int | None = None,
+) -> list[RuleResult]:
+    """Evaluate declared expectations against a profile (and the file).
+
+    Everything that can be answered from the profile is answered there; only
+    ``in(...)`` and ``matches(...)`` need to look at the values themselves.
+    """
+    parsed: list[tuple[str, str, str, str, object]] = []
+    results: list[RuleResult] = []
+
+    for text in rules:
+        try:
+            parsed.append((text, *parse_rule(text)))
+        except ValueError as exc:
+            results.append(RuleResult(rule=text, ok=False, detail=str(exc)))
+
+    columns = {c.name: c for c in profile.columns}
+    value_rules: list[tuple[int, str, str, object]] = []
+
+    for idx, (text, scope, column, kind, payload) in enumerate(parsed):
+        if scope == "table":
+            actual = profile.rows if column == "rows" else profile.cols
+            op, target = payload  # type: ignore[misc]
+            ok = _compare(float(actual), op, target)
+            results.append(RuleResult(
+                rule=text, ok=ok, column=column,
+                detail=f"{column} 实际 {actual:,}，要求 {op}{target:g}",
+            ))
+            continue
+
+        col = columns.get(column)
+        if col is None:
+            names = "、".join(list(columns)[:6])
+            results.append(RuleResult(
+                rule=text, ok=False, column=column,
+                detail=f"没有这一列（现有：{truncate(names, 60)}）",
+            ))
+            continue
+
+        if kind == "not-null":
+            ok = col.missing == 0
+            results.append(RuleResult(
+                rule=text, ok=ok, column=column,
+                detail=("没有缺失值" if ok
+                        else f"{col.missing:,} 个缺失值（{col.missing_rate:.1%}）"),
+            ))
+            continue
+
+        if kind == "unique":
+            if col.distinct_capped:
+                results.append(RuleResult(
+                    rule=text, ok=True, column=column,
+                    detail=f"唯一值超过 {DISTINCT_CAP:,}，按唯一处理",
+                ))
+                continue
+            present = col.total - col.missing
+            ok = col.distinct == present
+            results.append(RuleResult(
+                rule=text, ok=ok, column=column,
+                detail=(f"{col.distinct:,} 个值全部唯一" if ok
+                        else f"{col.distinct:,} 个不同值 / {present:,} 个非空值"),
+            ))
+            continue
+
+        if kind == "compare":
+            op, target = payload  # type: ignore[misc]
+            if col.kind not in _NUMERIC_KINDS or col.num_min is None:
+                results.append(RuleResult(
+                    rule=text, ok=False, column=column,
+                    detail=f"列类型是 {col.kind}，不是数值，没法比大小",
+                ))
+                continue
+            low, high = float(col.num_min), float(col.num_max)  # type: ignore[arg-type]
+            if op in (">=", ">"):
+                ok = _compare(low, op, target)
+                shown = f"最小值 {low:g}"
+            elif op in ("<=", "<"):
+                ok = _compare(high, op, target)
+                shown = f"最大值 {high:g}"
+            else:
+                ok = _compare(low, op, target) and _compare(high, op, target)
+                shown = f"{low:g} ~ {high:g}"
+            results.append(RuleResult(
+                rule=text, ok=ok, column=column,
+                detail=f"{shown}，要求 {op}{target:g}",
+            ))
+            continue
+
+        if kind == "compare-date":
+            op, target = payload  # type: ignore[misc]
+            if col.kind != "date" or col.date_min is None:
+                results.append(RuleResult(
+                    rule=text, ok=False, column=column,
+                    detail=f"列类型是 {col.kind}，不是日期，没法按日期比",
+                ))
+                continue
+            low_d = parse_date(col.date_min)
+            high_d = parse_date(col.date_max or col.date_min)
+            if low_d is None or high_d is None:
+                results.append(RuleResult(
+                    rule=text, ok=False, column=column, detail="日期解析失败",
+                ))
+                continue
+            if op in (">=", ">"):
+                ok = _compare(low_d.toordinal(), op, target.toordinal())
+                shown = f"最早 {col.date_min}"
+            elif op in ("<=", "<"):
+                ok = _compare(high_d.toordinal(), op, target.toordinal())
+                shown = f"最晚 {col.date_max}"
+            else:
+                ok = (_compare(low_d.toordinal(), op, target.toordinal())
+                      and _compare(high_d.toordinal(), op, target.toordinal()))
+                shown = f"{col.date_min} ~ {col.date_max}"
+            results.append(RuleResult(
+                rule=text, ok=ok, column=column,
+                detail=f"{shown}，要求 {op}{target.date()}",
+            ))
+            continue
+
+        value_rules.append((idx, column, kind, payload))
+
+    if value_rules:
+        scanned = _scan_values(path, value_rules, limit)
+        for idx, column, kind, payload in value_rules:
+            text = parsed[idx][0]
+            bad, examples = scanned.get(idx, (0, []))
+            col = columns[column]
+            present = col.total - col.missing
+            ok = bad == 0
+            if ok:
+                detail = f"{present:,} 个值全部符合"
+            else:
+                shown = "、".join(f"「{truncate(v, 14)}」" for v in examples)
+                detail = f"{bad:,} 个值不符合（{bad / max(present, 1):.1%}），例如 {shown}"
+            results.append(RuleResult(rule=text, ok=ok, column=column, detail=detail))
+
+    return results
+
+
+def render_rules(results: list[RuleResult]) -> str:
+    """Human summary of a contract check."""
+    failed = [r for r in results if not r.ok]
+    lines = [""]
+    lines.append("  " + bold("dataloupe") + dim(f"  v{__version__}") + "  " + bold("数据契约"))
+    lines.append("")
+    width = max((display_width(r.rule) for r in results), default=4)
+    for result in results:
+        mark = tint("✓", "32") if result.ok else tint("✗", "31")
+        lines.append(f"  {mark} {pad(result.rule, width)}  {dim(result.detail)}")
+    lines.append("")
+    if failed:
+        lines.append("  " + tint(f"✗ {len(failed)}/{len(results)} 条不通过。", "31"))
+    else:
+        lines.append("  " + tint(f"✓ {len(results)} 条全部通过。", "32"))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def rules_to_json(results: list[RuleResult]) -> list[dict]:
+    return [
+        {"rule": r.rule, "ok": r.ok, "column": r.column, "detail": r.detail}
+        for r in results
+    ]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dataloupe",
@@ -3558,6 +3909,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="配合 --diff：连新增列、疑似重命名、兼容类型变更也判为失败")
     parser.add_argument("--no-rows", action="store_true",
                         help="配合 --diff：跳过行级差异（大文件可省一次扫描）")
+    parser.add_argument("--require", action="append", metavar="RULE", default=None,
+                        help="声明一条数据契约，可重复。例：id:not-null、amount:>=0、"
+                             "status:in(a|b|c)、email:matches(^\\\\S+@\\\\S+$)、"
+                             "rows>=100。任一条不通过则退出码 1")
     parser.add_argument("--mask", action="store_true",
                         help="输出脱敏副本，把邮箱/手机号/身份证号等替换成掩码"
                              "（默认 <原名>.masked.csv）")
@@ -3674,15 +4029,21 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
 
-    # Exit code reflects data health: 0 clean, 1 has high-severity issues or
-    # scored below --fail-under. --json honours it too, because that is the
-    # form a CI gate consumes.
+    # Exit code reflects data health: 0 clean, 1 has high-severity issues,
+    # scored below --fail-under, or broke a declared contract. --json honours
+    # it too, because that is the form a CI gate consumes.
     failed = bool(profile.issues_by("high"))
     if args.fail_under is not None and profile.score < args.fail_under:
         failed = True
 
+    rule_results: list[RuleResult] = []
+    if args.require:
+        rule_results = check_rules(profile, path, args.require, limit=args.limit)
+        if any(not result.ok for result in rule_results):
+            failed = True
+
     if args.as_json:
-        print(render_json(profile))
+        print(render_json(profile, rule_results))
         return 1 if failed else 0
 
     if args.sql:
@@ -3691,6 +4052,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(render_terminal(profile, show_preview=args.preview))
+    if rule_results:
+        print(render_rules(rule_results))
 
     if args.fix or args.mask:
         source = load_source(path, limit=args.limit)

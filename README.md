@@ -217,6 +217,9 @@ python dataloupe.py last_week.csv today.csv --diff
 
 # ... or write a shareable HTML drift report
 python dataloupe.py last_week.csv today.csv --diff -o drift.html
+
+# Declare expectations; a broken contract exits 1
+python dataloupe.py data.csv --require "id:not-null" --require "rows>=1000"
 ```
 
 ```text
@@ -304,6 +307,64 @@ column itself was flagged, or the value is written with spaces or dashes;
 
 ---
 
+## Data contracts: write the requirement down
+
+A profile tells you what is wrong with a file. A contract tells you whether it
+meets *your* requirements. Those are different questions: data can be spotless
+and still not have the thousand rows you expected.
+
+```bash
+python dataloupe.py orders.csv \
+  --require "order_id:not-null" \
+  --require "order_id:unique" \
+  --require "amount:>0" \
+  --require "status:in(paid|pending|refunded)" \
+  --require "order_date:>=2024-01-01" \
+  --require "rows>=1000"
+```
+
+```text
+  dataloupe  v1.5.0  数据契约
+
+  ✓ order_id:not-null        没有缺失值
+  ✓ order_id:unique          240 个值全部唯一
+  ✓ amount:>0                最小值 45.6，要求 >0
+  ✗ status:in(paid|pending|refunded)  1 个值不符合（10.0%），例如 「试用用户」
+  ✓ order_date:>=2024-01-01  最早 2026-03-01，要求 >=2024-01-01
+  ✗ rows>=1000               rows 实际 240，要求 >=1000
+
+  ✗ 2/6 条不通过。
+```
+
+![contract output](docs/rules.svg)
+
+| Form | Meaning |
+|---|---|
+| `col:not-null` | No missing values in that column |
+| `col:unique` | Every non-empty value is distinct |
+| `col:>=N` `>N` `<=N` `<N` `=N` | Numeric bounds (checked against min/max) |
+| `col:>=2024-01-01` | Date bound, compared as `YYYY-MM-DD` |
+| `col:in(a\|b\|c)` | Every value is one of these |
+| `col:matches(REGEX)` | Every value matches the pattern |
+| `rows>=N` `cols<=N` | Table size |
+
+**Any failure exits 1**, so it drops straight into CI with no config file:
+
+```yaml
+- run: python dataloupe.py data/export.csv --require "id:not-null" --require "rows>=1000"
+```
+
+Two deliberate choices:
+
+- **A syntax mistake counts as a failure.** A typo in a contract must never look
+  like a pass.
+- **Comparing a text column with `>=` reports "not numeric"** instead of quietly
+  succeeding.
+
+`--json` puts the results under `rules`, so a pipeline can read them.
+
+---
+
 ## Correlations
 
 Every pair of numeric columns gets a Pearson correlation. Pairs above |r| ≥ 0.5
@@ -347,7 +408,7 @@ tolerance so a handful of dirty cells do not flip a numeric column to text.
 **Quality**
 - Missing rate per column
 - Fully duplicated rows
-- Mixed-type columns (how many values do not match the inferred type)
+- Mixed-type columns (how many values do not match, with the first three offending values named)
 - Leading/trailing whitespace
 - Full-width ASCII (`１２３`, `ＡＢＣ`) that silently breaks parsing
 - Invisible control characters
@@ -473,14 +534,14 @@ Three things make it fast:
 python -m unittest discover -s tests -v
 ```
 
-178 tests covering encoding detection, delimiter sniffing, type inference,
+196 tests covering encoding detection, delimiter sniffing, type inference,
 statistics correctness, correlation, streaming-vs-one-shot equivalence,
 reservoir accuracy, row-aligned correlation, streaming-vs-loading memory, CSV injection, DDL generation, exit codes, distribution drift,
-row-level diff, masking, HTML drift reports, quality checks, cleaning, xlsx parsing, HTML escaping, and
+row-level diff, masking, HTML drift reports, contract rules, bad-value samples, quality checks, cleaning, xlsx parsing, HTML escaping, and
 two-file schema drift (added/removed columns, likely renames, type pollution, quality regression).
 
 ```
-Ran 178 tests in 8.8s
+Ran 196 tests in 9.2s
 
 OK
 ```

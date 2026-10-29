@@ -142,6 +142,17 @@ def main():
     )
     write("diff.svg", dl.render_diff_terminal(diff))
 
+    users_path = ROOT / "examples" / "users.csv"
+    users = dl.analyse(users_path)
+    results = dl.check_rules(users, users_path, [
+        "id:unique",
+        "email:not-null",
+        "email:matches(^\\S+@\\S+$)",
+        "note:in(普通用户|VIP 客户)",
+        "rows>=100",
+    ])
+    write("rules.svg", dl.render_rules(results))
+
 
 if __name__ == "__main__":
     main()

@@ -132,6 +132,48 @@ jobs:
           fi
           echo "OK: drift.html is standalone"
 
+      - name: Data contracts gate the build
+        shell: bash
+        run: |
+          # A satisfied contract exits 0.
+          python dataloupe.py examples/sales.csv --no-color \
+            --require "order_id:not-null" \
+            --require "order_id:unique" \
+            --require "quantity:>=1" \
+            --require "order_date:>=2024-01-01" \
+            --require "rows>=100" > /dev/null
+          echo "OK: satisfied contract exits 0"
+
+          # A broken one exits 1. set +e is scoped and restored so a real
+          # failure below is not swallowed.
+          set +e
+          python dataloupe.py examples/sales.csv --no-color \
+            --require "rows>=100000" > /dev/null
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 for a broken contract, got $code"
+            exit 1
+          fi
+          echo "OK: broken contract exits 1"
+
+      - name: The report names the offending values
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import subprocess, sys, tempfile, os
+          from pathlib import Path
+          d = Path(tempfile.mkdtemp())
+          p = d / "mixed.csv"
+          p.write_text("amount\n" + "".join(f"{i}\n" for i in range(1, 10)) + "TBD\nN/A?\n",
+                       encoding="utf-8")
+          out = subprocess.run([sys.executable, "dataloupe.py", str(p), "--no-color"],
+                               capture_output=True, text=True, encoding="utf-8").stdout
+          assert "TBD" in out, out
+          assert "N/A?" in out, out
+          print("OK: bad values named")
+          EOF
+
       - name: Masking redacts and leaves the source alone
         shell: bash
         run: |

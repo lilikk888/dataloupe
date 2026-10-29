@@ -104,6 +104,9 @@ python dataloupe.py users.csv --mask
 # 对比两份导出，抓结构漂移（新列 / 删列 / 重命名 / 类型变了）
 python dataloupe.py last_week.csv today.csv --diff
 
+# 声明式契约：不满足就退出码 1
+python dataloupe.py data.csv --require "id:not-null" --require "rows>=1000"
+
 # 修好数据另存一份（原文件不动）
 python dataloupe.py data.csv --fix
 ```
@@ -299,6 +302,61 @@ python dataloupe.py users.csv --mask
 
 ---
 
+## 数据契约：把你的要求写成一行
+
+体检告诉你「这份数据有什么毛病」，契约告诉你「它有没有达到我的要求」。
+两者不一样：一份数据可以很干净，但没有我要的那 1000 行。
+
+```bash
+python dataloupe.py orders.csv \
+  --require "order_id:not-null" \
+  --require "order_id:unique" \
+  --require "amount:>0" \
+  --require "status:in(paid|pending|refunded)" \
+  --require "order_date:>=2024-01-01" \
+  --require "rows>=1000"
+```
+
+```text
+  dataloupe  v1.5.0  数据契约
+
+  ✓ order_id:not-null        没有缺失值
+  ✓ order_id:unique          240 个值全部唯一
+  ✓ amount:>0                最小值 45.6，要求 >0
+  ✗ status:in(paid|pending|refunded)  1 个值不符合（10.0%），例如 「试用用户」
+  ✓ order_date:>=2024-01-01  最早 2026-03-01，要求 >=2024-01-01
+  ✗ rows>=1000               rows 实际 240，要求 >=1000
+
+  ✗ 2/6 条不通过。
+```
+
+![数据契约输出](docs/rules.svg)
+
+支持这些写法：
+
+| 写法 | 含义 |
+|---|---|
+| `列:not-null` | 这一列不能有缺失值 |
+| `列:unique` | 这一列的值必须唯一 |
+| `列:>=N` `>N` `<=N` `<N` `=N` | 数值范围（比较最小/最大值） |
+| `列:>=2024-01-01` | 日期范围，按 `YYYY-MM-DD` 比 |
+| `列:in(a\|b\|c)` | 值必须在这个集合里 |
+| `列:matches(正则)` | 每个值都要匹配这条正则 |
+| `rows>=N` `cols<=N` | 行数 / 列数 |
+
+**任何一条不通过，退出码就是 1**，不用写配置文件，直接当 CI 门禁：
+
+```yaml
+- run: python dataloupe.py data/export.csv --require "id:not-null" --require "rows>=1000"
+```
+
+两个刻意的设计：
+
+- **语法写错也算不通过**。契约里的笔误不能看起来像通过。
+- **拿文本列比大小会报"不是数值"**，而不是悄悄放过。
+
+`--json` 会把结果放在 `rules` 字段里，方便程序读。
+
 ---
 
 ## 相关性
@@ -339,7 +397,7 @@ python dataloupe.py users.csv --mask
 **质量问题**
 - 每列缺失率
 - 完全重复的行
-- 类型混杂（有多少值不符合推断出的类型）
+- 类型混杂（有多少值不符合推断出的类型，并列出前 3 个坏值）
 - 首尾多余空格
 - 全角 ASCII（`１２３`、`ＡＢＣ`）——肉眼看着一样，程序直接算错
 - 不可见控制字符
@@ -455,12 +513,12 @@ for row in rows:              # 一次只持有一行
 python -m unittest discover -s tests -v
 ```
 
-178 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
-流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、退出码与 CI 门禁、分布漂移、行级差异、脱敏、漂移 HTML 报告、质量检测、数据清洗、
+196 个测试，覆盖编码识别、分隔符嗅探、类型推断、统计正确性、相关性、
+流式累加器与一次性计算的一致性、蓄水池抽样精度、相关系数的行对齐、流式与全量载入的内存对比、CSV 注入识别、建表语句生成、退出码与 CI 门禁、分布漂移、行级差异、脱敏、漂移 HTML 报告、数据契约断言、坏值样本、质量检测、数据清洗、
 xlsx 解析、HTML 转义、CLI 退出码、两文件 schema 漂移对比（增删列、疑似重命名、类型污染、质量退化）。
 
 ```
-Ran 178 tests in 8.8s
+Ran 196 tests in 9.2s
 
 OK
 ```
